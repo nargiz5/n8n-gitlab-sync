@@ -18,6 +18,9 @@ n8n has built-in workflow history and version restore, but full Git-based versio
 Schedule Trigger
      │
      ▼
+Set GitLab Config (URL, group path/ID, token, root folder ID)
+     │
+     ▼
 Read workflow tree from n8n's Postgres DB (via SSH)
      │
      ▼
@@ -84,25 +87,26 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
 
 1. **Import the workflow.** Download [`Gitlab-n8n-synchronization-prod.json`](./Gitlab-n8n-synchronization-prod.json) and import it into your n8n instance.
 
-2. **Configure credentials** in n8n:
-   | Credential | Type | Used for |
+2. **Reconnect credentials** in n8n. Every node's credential reference was stripped when this was published, so each `HTTP Request`, `SSH`, and `OpenRouter` node will show as unlinked after import — open each one and pick (or create) your own:
+
+   | Credential type | Used by | Used for |
    |---|---|---|
-   | GitLab access token | HTTP Header Auth | Creating/reading/writing GitLab projects and files |
-   | SSH key | SSH Private Key | Connecting to the Postgres host to read the folder tree |
-   | OpenRouter API key | OpenRouter API | Generating changelog entries |
+   | HTTP Header Auth (`PRIVATE-TOKEN: <your GitLab token>`) | All GitLab `HTTP Request` nodes | Creating/reading/writing GitLab projects and files |
+   | HTTP Header Auth | `GET workflow by ID` | Authenticating against your own n8n instance's REST API |
+   | SSH Private Key | `n8n_backup.sh` | Connecting to the Postgres host to read the folder tree |
+   | OpenRouter API | Both `OpenRouter Chat Model` nodes | Generating changelog entries |
 
-3. **Set environment variables.** The `Resolve GitLab subgroup path` node reads its GitLab connection details from environment variables rather than hardcoded values, so nothing sensitive lives in the workflow JSON itself. Set these on your n8n instance (e.g. in your `.env` file or however you manage n8n's environment):
+3. **Fill in the `Set GitLab Config` node.** This is the first node after the trigger, and it's the single place all the GitLab/n8n config values live — nothing else in the workflow should need editing besides this node and the credentials above.
 
-   | Variable | Example | Notes |
+   | Field | Example | Notes |
    |---|---|---|
    | `GITLAB_URL` | `https://gitlab.example.com` | Your GitLab instance base URL |
    | `GITLAB_ROOT_FULL_PATH` | `yourgroup/n8n-backups` | The GitLab group path workflows will sync into |
    | `GITLAB_ROOT_GROUP_ID` | `123` | The numeric ID of that root GitLab group |
-   | `GITLAB_PRIVATE_TOKEN` | `glpat-xxxxxxxx` | A GitLab access token with API + write_repository scope |
+   | `N8N_ROOT_FOLDER_ID` | `abc123XYZ` | The n8n folder ID to track — find it in n8n's UI URL when viewing the folder, or by querying the `folder` table directly |
+   | `GITLAB_PRIVATE_TOKEN` | `glpat-xxxxxxxx` | A GitLab access token with API + write_repository scope, used by the `Resolve GitLab subgroup path` code node |
 
-   Also update the **root folder ID to track** — the `WHERE id = '...'` value in the SQL query from the previous section. Find it in n8n's UI URL when viewing the folder, or by querying the `folder` table directly.
-
-   > ⚠️ Before publishing your own copy of this workflow anywhere public, search the exported JSON for your GitLab URL, tokens, group IDs, and any credential names — make sure nothing identifying or secret is hardcoded into a Code node. n8n's built-in credential fields keep secrets out of the JSON automatically, but values typed directly into a Code node (like the one above did originally) do not.
+   > ⚠️ These values are stored as plain text inside the node, which means they end up in the exported JSON — unlike the credentials above, which n8n encrypts and keeps out of exports. Fill this node in on your own instance, but **never export/commit/share this workflow with real values still in it.** If you plan to keep a copy of this workflow in a public repo, keep it with placeholder values and fill in the real ones only after importing.
 
 4. **Adjust the schedule.** The `Schedule Trigger` node defaults to once daily; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
 
