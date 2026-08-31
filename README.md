@@ -124,9 +124,7 @@ A synced workflow appears in GitLab as a `.json` file plus a `CHANGELOG.md`, wit
 
 ## Limitations
 
-- Changes are pushed directly to a `dev` branch — there's no review/approval step before something lands. For multi-person teams, adding a merge-request-based flow instead of direct commits is recommended.
 - The folder-tree query is written against n8n's current Postgres schema; if that schema changes in a future n8n version, the query may need updating.
-- This is a one-way sync (n8n → GitLab). It does not restore or deploy workflows back into n8n from GitLab.
 
 ## License
 
