@@ -91,10 +91,18 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
    | SSH key | SSH Private Key | Connecting to the Postgres host to read the folder tree |
    | OpenRouter API key | OpenRouter API | Generating changelog entries |
 
-3. **Set your configuration values** — search the workflow for these and replace with your own:
-   - Root folder ID to track (the `WHERE id = '...'` value in the SQL query — find it in n8n's UI URL when viewing a folder, or query the `folder` table directly)
-   - Your GitLab base URL and top-level group/namespace
-   - Your n8n instance's API base URL
+3. **Set environment variables.** The `Resolve GitLab subgroup path` node reads its GitLab connection details from environment variables rather than hardcoded values, so nothing sensitive lives in the workflow JSON itself. Set these on your n8n instance (e.g. in your `.env` file or however you manage n8n's environment):
+
+   | Variable | Example | Notes |
+   |---|---|---|
+   | `GITLAB_URL` | `https://gitlab.example.com` | Your GitLab instance base URL |
+   | `GITLAB_ROOT_FULL_PATH` | `yourgroup/n8n-backups` | The GitLab group path workflows will sync into |
+   | `GITLAB_ROOT_GROUP_ID` | `123` | The numeric ID of that root GitLab group |
+   | `GITLAB_PRIVATE_TOKEN` | `glpat-xxxxxxxx` | A GitLab access token with API + write_repository scope |
+
+   Also update the **root folder ID to track** — the `WHERE id = '...'` value in the SQL query from the previous section. Find it in n8n's UI URL when viewing the folder, or by querying the `folder` table directly.
+
+   > ⚠️ Before publishing your own copy of this workflow anywhere public, search the exported JSON for your GitLab URL, tokens, group IDs, and any credential names — make sure nothing identifying or secret is hardcoded into a Code node. n8n's built-in credential fields keep secrets out of the JSON automatically, but values typed directly into a Code node (like the one above did originally) do not.
 
 4. **Adjust the schedule.** The `Schedule Trigger` node defaults to once daily; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
 
