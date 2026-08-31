@@ -1,0 +1,1400 @@
+{
+  "name": "Gitlab-n8n-synchronization-prod",
+  "nodes": [
+    {
+      "parameters": {
+        "authentication": "privateKey",
+        "command": "=docker exec n8n_postgres psql -U n8n -d n8n -t -A -c \"WITH RECURSIVE folder_tree AS (SELECT id, name, \\\"parentFolderId\\\", name::text AS folder_path FROM folder WHERE id = '{{ $('Set GitLab Config').first().json.N8N_ROOT_FOLDER_ID }}' UNION ALL SELECT f.id, f.name, f.\\\"parentFolderId\\\", ft.folder_path || '/' || f.name FROM folder f JOIN folder_tree ft ON f.\\\"parentFolderId\\\" = ft.id) SELECT COALESCE(json_agg(json_build_object('workflow_id', w.id, 'workflow_name', w.name, 'folder_path', ft.folder_path) ORDER BY ft.folder_path, w.name), '[]'::json) FROM workflow_entity w JOIN folder_tree ft ON w.\\\"parentFolderId\\\" = ft.id\""
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        -832,
+        6992
+      ],
+      "id": "6bb73649-bea6-4a1b-ac5c-4275ac1f0094",
+      "name": "n8n_backup.sh",
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "SSH Key - n8n DB Server"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{$json.projectId}}/repository/files/{{encodeURIComponent($json.slug + '.json')}}/raw",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ref",
+              "value": "dev"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 800
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2896,
+        6400
+      ],
+      "id": "3aa551cf-046a-46e7-907d-16abe89f13a4",
+      "name": "fetch matching file from GitLab1",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction stableStringify(obj) {\n  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);\n  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';\n  const keys = Object.keys(obj).sort();\n  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';\n}\n\n// Shows exactly what text was inserted/removed instead of dumping full before/after blobs.\nfunction stringDiff(oldStr, newStr) {\n  let start = 0;\n  const maxStart = Math.min(oldStr.length, newStr.length);\n  while (start < maxStart && oldStr[start] === newStr[start]) start++;\n\n  let endOld = oldStr.length, endNew = newStr.length;\n  while (endOld > start && endNew > start && oldStr[endOld - 1] === newStr[endNew - 1]) {\n    endOld--; endNew--;\n  }\n\n  const removed = oldStr.slice(start, endOld);\n  const added = newStr.slice(start, endNew);\n\n  if (!removed && added) return `added text: \"${added}\"`;\n  if (removed && !added) return `removed text: \"${removed}\"`;\n  if (removed && added) return `replaced \"${removed}\" with \"${added}\"`;\n  return 'value changed (no textual diff detected)';\n}\n\nfunction trim(v, max = 120) {\n  if (v === undefined) return 'undefined';\n  return v.length > max ? v.slice(0, max) + '\\u2026' : v;\n}\n\n// Fields n8n auto-touches on nearly every save/drag with no real semantic change.\nconst NODE_NOISE_KEYS = new Set(['position', 'versionCounter', 'id', 'webhookId']);\n\n// n8n masks/rotates credential IDs for credentials the API caller doesn't directly\n// own or that are shared/placeholder (\"test-temp-XXX\") — the id can differ on every\n// single fetch even though the actual assignment never changed. Only the credential\n// *name* is a stable signal of a real reassignment, so we compare on name only.\nfunction normalizeCredentials(creds) {\n  if (!creds || typeof creds !== 'object') return creds;\n  const out = {};\n  Object.keys(creds).sort().forEach(type => {\n    const c = creds[type] || {};\n    out[type] = { name: c.name };\n  });\n  return out;\n}\n\nfunction nodesEqualIgnoringNoise(oldNode, newNode) {\n  const stripNoise = (n) => {\n    const c = { ...n };\n    NODE_NOISE_KEYS.forEach(k => delete c[k]);\n    if (c.credentials) c.credentials = normalizeCredentials(c.credentials);\n    return c;\n  };\n  return stableStringify(stripNoise(oldNode)) === stableStringify(stripNoise(newNode));\n}\n\nfunction diffParams(oldNode, newNode) {\n  const changes = [];\n  const oldParams = (oldNode && oldNode.parameters) || {};\n  const newParams = (newNode && newNode.parameters) || {};\n  const allKeys = new Set([...Object.keys(oldParams), ...Object.keys(newParams)]);\n\n  allKeys.forEach(key => {\n    const oldRaw = oldParams[key];\n    const newRaw = newParams[key];\n    const oldStr = stableStringify(oldRaw);\n    const newStr = stableStringify(newRaw);\n    if (oldStr === newStr) return;\n\n    if (typeof oldRaw === 'string' && typeof newRaw === 'string') {\n      changes.push(`${key}: ${stringDiff(oldRaw, newRaw)}`);\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\nfunction diffNodeFields(oldNode, newNode) {\n  const changes = [];\n  const keys = new Set([...Object.keys(oldNode || {}), ...Object.keys(newNode || {})]);\n\n  keys.forEach(key => {\n    if (key === 'parameters' || NODE_NOISE_KEYS.has(key)) return;\n    const oldVal = oldNode ? oldNode[key] : undefined;\n    const newVal = newNode ? newNode[key] : undefined;\n    const oldStr = stableStringify(oldVal);\n    const newStr = stableStringify(newVal);\n    if (oldStr === newStr) return;\n\n    if (key === 'disabled') {\n      changes.push(newVal === true ? 'Node deactivated (disabled in n8n).' : 'Node re-activated (enabled in n8n).');\n    } else if (key === 'notes') {\n      if (typeof oldVal === 'string' && typeof newVal === 'string') {\n        changes.push(`notes: ${stringDiff(oldVal, newVal)}`);\n      } else {\n        changes.push('notes updated.');\n      }\n    } else if (key === 'credentials') {\n      const oldNorm = normalizeCredentials(oldVal);\n      const newNorm = normalizeCredentials(newVal);\n      if (stableStringify(oldNorm) !== stableStringify(newNorm)) {\n        changes.push('credentials assignment changed.');\n      }\n      // else: only the (rotating/masked) id differed — not a real change, skip.\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\n// ---- Connection (edge) level diffing ----\nfunction flattenConnections(connections) {\n  const edges = [];\n  Object.keys(connections || {}).forEach(sourceName => {\n    const outputTypes = connections[sourceName] || {};\n    Object.keys(outputTypes).forEach(outputType => {\n      const branches = outputTypes[outputType] || [];\n      branches.forEach((branch, outputIndex) => {\n        (branch || []).forEach(conn => {\n          if (!conn) return;\n          edges.push({\n            source: sourceName,\n            outputType,\n            outputIndex,\n            target: conn.node,\n            targetInputType: conn.type,\n            targetInputIndex: conn.index\n          });\n        });\n      });\n    });\n  });\n  return edges;\n}\n\nfunction edgeKey(e) {\n  return `${e.source}|${e.outputType}|${e.outputIndex}|${e.target}|${e.targetInputType}|${e.targetInputIndex}`;\n}\n\nfunction diffConnections(oldConn, newConn) {\n  const oldEdges = flattenConnections(oldConn);\n  const newEdges = flattenConnections(newConn);\n  const oldMap = new Map(oldEdges.map(e => [edgeKey(e), e]));\n  const newMap = new Map(newEdges.map(e => [edgeKey(e), e]));\n\n  const added = [];\n  const removed = [];\n\n  newMap.forEach((e, k) => {\n    if (!oldMap.has(k)) added.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n  oldMap.forEach((e, k) => {\n    if (!newMap.has(k)) removed.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n\n  return { added, removed };\n}\n\nfunction summarizeChanges(oldWf, newWf) {\n  if (!oldWf) return ['New workflow file (no previous version found in GitLab).'];\n  const lines = [];\n\n  const oldNodes = Array.isArray(oldWf.nodes) ? oldWf.nodes : [];\n  const newNodes = Array.isArray(newWf.nodes) ? newWf.nodes : [];\n  const oldById = new Map(oldNodes.map(n => [n.name || n.id, n]));\n  const newById = new Map(newNodes.map(n => [n.name || n.id, n]));\n\n  const added = [];\n  const removed = [];\n  const modified = [];\n\n  newById.forEach((node, id) => {\n    if (!oldById.has(id)) {\n      added.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    } else {\n      const oldNode = oldById.get(id);\n      if (!nodesEqualIgnoringNoise(oldNode, node)) {\n        const paramChanges = diffParams(oldNode, node);\n        const fieldChanges = diffNodeFields(oldNode, node);\n        modified.push({ name: node.name || id, type: node.type || 'unknown type', paramChanges, fieldChanges });\n      }\n    }\n  });\n\n  oldById.forEach((node, id) => {\n    if (!newById.has(id)) {\n      removed.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    }\n  });\n\n  if (added.length) lines.push(`Added nodes: ${added.join(', ')}`);\n  if (removed.length) lines.push(`Removed nodes: ${removed.join(', ')}`);\n  if (modified.length) {\n    modified.forEach(m => {\n      lines.push(`Modified node \"${m.name}\" (${m.type}):`);\n      const allChanges = [...m.fieldChanges, ...m.paramChanges];\n      if (allChanges.length) {\n        allChanges.forEach(c => lines.push(`  - ${c}`));\n      } else {\n        lines.push('  - value changed (details not detected)');\n      }\n    });\n  }\n\n  const connDiff = diffConnections(oldWf.connections || {}, newWf.connections || {});\n  if (connDiff.added.length) lines.push(`Added connections: ${connDiff.added.join(', ')}`);\n  if (connDiff.removed.length) lines.push(`Removed connections: ${connDiff.removed.join(', ')}`);\n\n  const skip = new Set(['nodes', 'connections']);\n  Object.keys(newWf || {}).forEach(key => {\n    if (skip.has(key)) return;\n    const oldVal = oldWf ? oldWf[key] : undefined;\n    const newVal = newWf[key];\n    if (stableStringify(oldVal) !== stableStringify(newVal)) {\n      lines.push(`Field \"${key}\" changed.`);\n    }\n  });\n\n  if (lines.length === 0) lines.push('Workflow content changed (no structural diff detected \\u2014 likely formatting/metadata only).');\n\n  return lines;\n}\n\n// DÜZƏLİŞ: eyni slug-a sahib iki fərqli workflow olduqda (məs. \"check_webhooks_backup\"\n// və \"check_webhooks-backup\" -> hər ikisi \"check-webhooks-backup\" slug-una düşür) onlar\n// eyni GitLab faylını \"tennis-match\" kimi bir-birinin üzərinə yazır və isDifferent\n// heç vaxt sabitləşmir. Bunu erkən aşkarlamaq üçün xəbərdarlıq/atma əlavə edirik.\nconst perItem3All = $('per Item3').all();\nconst slugCounts = {};\nperItem3All.forEach(p => {\n  const s = p.json.slug;\n  if (!s) return;\n  slugCounts[s] = (slugCounts[s] || 0) + 1;\n});\nconst duplicateSlugs = Object.keys(slugCounts).filter(s => slugCounts[s] > 1);\nif (duplicateSlugs.length) {\n  throw new Error(\n    `Slug collision detected — multiple workflows map to the same GitLab file and will ` +\n    `overwrite each other forever: ${duplicateSlugs.join(', ')}. Rename one of the ` +\n    `colliding n8n workflows so their slugs become unique before syncing.`\n  );\n}\n\nreturn items.map((item, index) => {\n  // DÜZƏLİŞ: Əgər item artıq özündə n8nWorkflow daşıyırsa (loop-back), birbaşa onu götürürük,\n  // əks halda (ilk keçid) Prepare workflow-dan sabit açara (projectId/slug) görə uyğunlaşdırırıq.\n  // İndex ilə uyğunlaşdırma etibarsızdır, çünki aradakı HTTP node batching +\n  // continueRegularOutput ilə işlədiyi üçün sıra execution-lar arası fərqli ola bilər.\n  const matchByKey = (arr) => arr.find(p =>\n    (item.json.projectId !== undefined && p.json.projectId === item.json.projectId) ||\n    (item.json.slug !== undefined && p.json.slug === item.json.slug)\n  );\n\n  const n8nWorkflow = item.json.n8nWorkflow\n    || matchByKey(perItem3All)?.json\n    || perItem3All[index].json;\n\n  const projectId = item.json.projectId\n    || matchByKey(perItem3All)?.json?.projectId\n    || perItem3All[index].json.projectId;\n\n  const workflowName = n8nWorkflow.originalName || n8nWorkflow.name;\n\n  let gitlabContent;\n  try {\n    // n8n HTTP Request node fullResponse:true olduqda cavab item.json.body-də gəlir,\n    // item.json.data-da yox — əvvəlki kod həmişə data axtardığı üçün gitlabContent\n    // həmişə null qalırdı və hər fayl \"yeni\" (isDifferent=true) kimi görünürdü.\n    const rawData = item.json.body !== undefined ? item.json.body : item.json.data;\n    gitlabContent = typeof rawData === 'string'\n      ? JSON.parse(rawData)\n      : rawData;\n  } catch (e) {\n    gitlabContent = null;\n  }\n\n  const volatileKeys = [\n    'updatedAt', 'createdAt', 'versionId', 'activeVersionId', 'activeVersion',\n    'shared', 'meta', 'slug', 'originalName', 'id', 'triggerCount',\n    'isArchived', 'active', 'tags', 'pinData', 'staticData', 'versionCounter'\n  ];\n\n  const stripVolatile = (wf) => {\n    if (!wf) return null;\n    const clean = { ...wf };\n    volatileKeys.forEach(k => delete clean[k]);\n    return clean;\n  };\n\n  const stripNodeNoise = (wf) => {\n    if (!wf || !Array.isArray(wf.nodes)) return wf;\n    const clone = { ...wf };\n    clone.nodes = wf.nodes.map(node => {\n      const n = { ...node };\n      NODE_NOISE_KEYS.forEach(k => delete n[k]);\n      return n;\n    });\n    return clone;\n  };\n\n  const cleanGitlab = stripNodeNoise(stripVolatile(gitlabContent));\n  const cleanN8n = stripNodeNoise(stripVolatile(n8nWorkflow));\n\n  const gitlabStr = stableStringify(cleanGitlab);\n  const n8nStr = stableStringify(cleanN8n);\n  const isDifferent = gitlabStr !== n8nStr;\n\n  const changeSummary = isDifferent ? summarizeChanges(cleanGitlab, cleanN8n) : [];\n  const changeSummaryText = changeSummary.map(l => `- ${l}`).join('\\n');\n\n  return {\n    json: {\n      workflowName,\n      slug: n8nWorkflow.slug,\n      projectId,\n      n8nWorkflow,\n      isDifferent,\n      changeSummary,\n      changeSummaryText,\n      diffCheckedAt: new Date().toISOString(),\n      debug: {\n        gitlabContentWasNull: gitlabContent === null,\n        gitlabKeys: cleanGitlab ? Object.keys(cleanGitlab).sort() : [],\n        n8nKeys: cleanN8n ? Object.keys(cleanN8n).sort() : []\n      }\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        6400
+      ],
+      "id": "eeda9bd0-6d1e-4d2a-b98f-c7c21d2249f8",
+      "name": "Diff workflow JSON1"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{$json.projectId}}/repository/files/{{encodeURIComponent($json.slug + '.json')}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"branch\": \"dev\",\n  \"content\": {{ JSON.stringify(JSON.stringify($json.n8nWorkflow, null, 2)) }},\n  \"commit_message\": {{ JSON.stringify('Sync workflow: ' + $json.workflowName) }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          },
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3952,
+        6544
+      ],
+      "id": "b895cd18-1c76-4cdc-8994-d1d023159750",
+      "name": "Update JSON1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f8d52c41-3356-4a4b-9bad-cba219ff1e20",
+              "leftValue": "={{ $json.allProjectsExist }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1104,
+        6992
+      ],
+      "id": "9a63b6ef-a875-46d0-b1d8-d55af64d332a",
+      "name": "if all of them have repo1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst existing = [];\nconst missing = [];\n\nitems.forEach((item, index) => {\n  const slugData = $('Resolve GitLab subgroup path').itemMatching(index).json;\n\n  const statusCode = item.json.statusCode;\n  const isSuccess = statusCode === 200 && item.json.body && item.json.body.id;\n  const isMissing = !!item.json.error || statusCode === 404;\n\n  const currentGroupId = slugData.namespaceId || slugData.id || slugData.namespace_id;\n\n  const record = {\n    ...slugData,\n    namespaceId: currentGroupId,\n    namespace_id: currentGroupId,\n    projectId: isSuccess ? item.json.body.id : null\n  };\n\n  if (isSuccess) {\n    existing.push(record);\n  } else {\n    missing.push(record);\n  }\n});\n\nconst allProjectsExist = missing.length === 0;\n\nreturn [\n  {\n    json: {\n      allProjectsExist,\n      existingCount: existing.length,\n      missingCount: missing.length,\n      existing,\n      missing\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        6992
+      ],
+      "id": "1957952a-0e1c-408a-bf1a-aafe96855daf",
+      "name": "division1"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "missing",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1312,
+        7216
+      ],
+      "id": "cc479172-0512-408f-8f9b-4b25a9855436",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $json.slug }}\",\n  \"path\": \"{{ $json.slug }}\",\n  \"namespace_id\": {{ $json.namespace_id }},\n  \"default_branch\": \"dev\",\n  \"initialize_with_readme\": false\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1328,
+        7456
+      ],
+      "id": "6b717002-eafd-4fc2-9fa5-e64f9ead661f",
+      "name": "Create repo1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential (alt)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 60
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1328,
+        7712
+      ],
+      "id": "1eeb0c2c-ba58-490b-a543-74f86a876782",
+      "name": "Wait2",
+      "webhookId": "69b84324-00d2-4786-931a-ab8fa7c0baad"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{$json.projectId}}/repository/files/{{encodeURIComponent($json.slug + '.json')}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ref",
+              "value": "dev"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1824,
+        6800
+      ],
+      "id": "b4f42621-b31f-4b2e-b602-9a8dea9c1c92",
+      "name": "Check if file exists1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential (alt)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const existing = $(\"if all of them have repo1\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        6800
+      ],
+      "id": "f8bbef65-5a72-44ac-bb8e-4711a9909a19",
+      "name": "per Item2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst existing = [];\nconst missing = [];\n\nitems.forEach((item, index) => {\n  const workflow = $('per Item2').itemMatching(index).json;\n\n  const status = item.json.statusCode ?? item.json.error?.status;\n\n  if (status === 200) {\n    existing.push(workflow);\n  } else if (status === 404 || item.json.error) {\n    missing.push(workflow);\n  }\n});\n\nreturn [{\n  json: {\n    allFilesExist: missing.length === 0,\n    existingCount: existing.length,\n    missingCount: missing.length,\n    existing,\n    missing\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        6800
+      ],
+      "id": "358375f8-2127-4dad-9d78-ba5d7e409631",
+      "name": "Divide based on file exsistance1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "52706836-6ba4-4272-b032-85228d853f46",
+              "leftValue": "={{ $json.allFilesExist }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2304,
+        6800
+      ],
+      "id": "be30b642-49cb-4fe7-804f-c43cf567c0a1",
+      "name": "If all of them have file1"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "missing",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2352,
+        7280
+      ],
+      "id": "eb25f04d-038e-432c-b4d8-348ea8c31bb7",
+      "name": "Split Out4"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $json.projectId }}/repository/files/{{ encodeURIComponent($json.slug + '.json') }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "branch",
+              "value": "dev"
+            },
+            {
+              "name": "commit_message",
+              "value": "Create workflow JSON"
+            },
+            {
+              "name": "content",
+              "value": "=\"\""
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 800
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2560,
+        7280
+      ],
+      "id": "af183fe2-6bc5-44f8-b115-8e1248330c38",
+      "name": "HTTP Request1",
+      "retryOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3024,
+        7264
+      ],
+      "id": "59f33c2d-bdbf-4024-bc4a-495c33fe6023",
+      "name": "Wait3",
+      "webhookId": "2d370fe1-1705-40d2-988d-83708fe26618"
+    },
+    {
+      "parameters": {
+        "jsCode": "const existing = $(\"If all of them have file1\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2672,
+        6560
+      ],
+      "id": "8f107252-f6c2-41e2-ab0f-4bcb71747a0e",
+      "name": "per Item3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst different = items.filter(item => item.json.isDifferent).map(item => item.json);\nconst same = items.filter(item => !item.json.isDifferent).map(item => item.json);\nreturn [\n  {\n    json: {\n      hasDifferences: different.length > 0,\n      differentCount: different.length,\n      sameCount: same.length,\n      different,\n      same\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3344,
+        6400
+      ],
+      "id": "b4f5400f-57b1-4805-9f46-b01bce8160f7",
+      "name": "Create arrays1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "cdb4fb9c-68d5-423c-a029-d11976dc24cc",
+              "leftValue": "={{ $json.hasDifferences }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3568,
+        6400
+      ],
+      "id": "24da89c0-9471-4829-93b8-f1c6231d1af2",
+      "name": "If no need to upload1"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "different",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        3760,
+        6544
+      ],
+      "id": "fae64e98-89c0-45ea-b075-470f1b463378",
+      "name": "Split Out5"
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out4').item.json.projectId }}/protected_branches/dev",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3312,
+        7264
+      ],
+      "id": "d4834fd1-0ee9-4fb2-83ea-f335dbd6bafe",
+      "name": "Unprotect dev",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out4').item.json.projectId }}/repository/branches?branch=release&ref=dev",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2784,
+        7264
+      ],
+      "id": "19524e0c-28a4-428b-bd21-c0703e462fe4",
+      "name": "Create Release1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out5').item.json.projectId }}/repository/files/CHANGELOG.md/raw",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ref",
+              "value": "dev"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 800
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4560,
+        6752
+      ],
+      "id": "f850c24b-9743-4f31-a1a6-5d6f7215f3db",
+      "name": "Get existing changelog1",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction bakuTimestamp() {\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'Asia/Baku',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));\n  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (Baku, GMT+4)`;\n}\n\nfunction findStructured(obj, depth) {\n  if (!obj || typeof obj !== 'object' || depth > 6) return null;\n  if (Array.isArray(obj.added) || Array.isArray(obj.changed) || Array.isArray(obj.removed) || typeof obj.summary === 'string') {\n    return {\n      summary: obj.summary || '',\n      added: Array.isArray(obj.added) ? obj.added : [],\n      changed: Array.isArray(obj.changed) ? obj.changed : [],\n      removed: Array.isArray(obj.removed) ? obj.removed : []\n    };\n  }\n  for (const key of Object.keys(obj)) {\n    const val = obj[key];\n    if (val && typeof val === 'object') {\n      const found = findStructured(val, depth + 1);\n      if (found) return found;\n    }\n  }\n  return null;\n}\n\nfunction renderStructured(result) {\n  const blocks = [];\n  if (result.summary) blocks.push(result.summary);\n  if (result.added.length) blocks.push('### Added\\n' + result.added.map(l => `- ${l}`).join('\\n'));\n  if (result.changed.length) blocks.push('### Changed\\n' + result.changed.map(l => `- ${l}`).join('\\n'));\n  if (result.removed.length) blocks.push('### Removed\\n' + result.removed.map(l => `- ${l}`).join('\\n'));\n  return blocks.join('\\n\\n');\n}\n\nreturn items.map((item, index) => {\n  const src = $('Split Out5').all()[index].json;\n  const resp = item.json;\n  const changelogExists = resp.statusCode === 200;\n  const existingContent = changelogExists && typeof resp.data === 'string' ? resp.data : '';\n  const timestamp = bakuTimestamp();\n\n  let aiResult = null;\n  try {\n    const aiItem = $('AI Agent').all()[index];\n    aiResult = aiItem && aiItem.json ? findStructured(aiItem.json, 0) : null;\n  } catch (e) {\n    aiResult = null;\n  }\n\n  let bodyText;\n  if (aiResult && (aiResult.summary || aiResult.added.length || aiResult.changed.length || aiResult.removed.length)) {\n    bodyText = renderStructured(aiResult);\n  } else {\n    bodyText = (src.changeSummaryText && src.changeSummaryText.length) ? src.changeSummaryText : '- Workflow updated.';\n  }\n\n  const entry = `## ${timestamp} \\u2014 ${src.workflowName}\\n\\n${bodyText}\\n\\n`;\n\n  return {\n    json: {\n      ...src,\n      changelogExists,\n      changelogContent: entry + existingContent\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4864,
+        6752
+      ],
+      "id": "5eaa9415-0aa1-421c-bec8-3d6404069e86",
+      "name": "Build changelog entry1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "04e016a5-70bb-4aca-a3b3-22140a27d587",
+              "leftValue": "={{ $json.changelogExists }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        5184,
+        6752
+      ],
+      "id": "2298824b-9df5-46bb-bed8-ef194965a70b",
+      "name": "Changelog exists?1"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{$json.projectId}}/repository/files/CHANGELOG.md",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"branch\": \"dev\",\n  \"content\": {{ JSON.stringify($json.changelogContent) }},\n  \"commit_message\": {{ JSON.stringify('Update changelog: ' + $json.workflowName) }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          },
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5408,
+        6640
+      ],
+      "id": "78645821-8e01-4296-aa93-be8fcf7f1f70",
+      "name": "Update CHANGELOG.md1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{$json.projectId}}/repository/files/CHANGELOG.md",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"branch\": \"dev\",\n  \"content\": {{ JSON.stringify($json.changelogContent) }},\n  \"commit_message\": {{ JSON.stringify('Update changelog: ' + $json.workflowName) }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          },
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5424,
+        6864
+      ],
+      "id": "e9b080e8-6bbf-473e-a0c3-5376dc76bda5",
+      "name": "Create CHANGELOG.md1",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst stdout = input.stdout || '';\n\nif (input.code && input.code !== 0) {\n  throw new Error(\n    `n8n folder query exited with code ${input.code}: ${input.stderr || 'no stderr'}`\n  );\n}\n\nif (!stdout.trim()) {\n  throw new Error('n8n folder query returned empty stdout.');\n}\n\nlet workflows;\n\ntry {\n  workflows = JSON.parse(stdout);\n} catch (error) {\n  throw new Error(\n    `Failed to parse JSON from n8n folder query: ${error.message}\\n\\n` +\n    `stdout:\\n${stdout}`\n  );\n}\n\nif (!Array.isArray(workflows)) {\n  throw new Error('Expected query output to be a JSON array.');\n}\n\nif (workflows.length === 0) {\n  throw new Error('The query returned 0 workflows.');\n}\n\nreturn workflows.map(workflow => {\n  const folderPath = workflow.folder_path || '';\n\n  const folderSegments = folderPath\n    .split('/')\n    .filter(Boolean);\n\n  return {\n    json: {\n      workflowId: workflow.workflow_id,\n      workflowName: workflow.workflow_name,\n      folderPath,\n      folderSegments\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        6992
+      ],
+      "id": "a3e0b9a2-ec09-4c84-8d99-626603cf3d0c",
+      "name": "Parse n8n tree"
+    },
+    {
+      "parameters": {
+        "url": "=https://localhost:5678/api/v1/workflows/{{ $json.workflowId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -208,
+        6992
+      ],
+      "id": "5e01a0c4-82d5-4cce-b4ed-41fba78c4912",
+      "name": "GET workflow by ID",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "n8n API Credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Generate the changelog entry now based on the detected changes described above.",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "=You are a deterministic diff-to-changelog transformer for an internal DevSecOps automation system. You do not analyze, infer, or add anything — you only reformat the exact diff below into three categorized lists.\n\nWorkflow name:\n{{ $('Split Out5').all()[$itemIndex].json.workflowName }}\n\nDetected changes (a complete, machine-generated diff — nothing happened beyond what is listed here):\n{{ $('Split Out5').all()[$itemIndex].json.changeSummaryText }}\n\nHOW TO READ THE DIFF — every line follows one of these exact patterns. Map each one using this table, with no exceptions:\n\n- \"Added nodes: X (type), Y (type)\" → one \"added\" bullet per node: Added node \"X\" (type).\n- \"Removed nodes: X (type)\" → one \"removed\" bullet per node: Removed node \"X\" (type).\n- \"Modified node \"X\" (type):\" followed by indented \"  - ...\" lines → one \"changed\" bullet per indented line, in the form Node \"X\": <that line's content>. Use this sub-mapping for the indented line's own content:\n  - \"Node deactivated (disabled in n8n).\" → Node \"X\" was deactivated (disabled).\n  - \"Node re-activated (enabled in n8n).\" → Node \"X\" was re-activated (enabled).\n  - \"<param>: added text: \"...\"\" → Node \"X\" — <param> had text added: \"...\".\n  - \"<param>: removed text: \"...\"\" → Node \"X\" — <param> had text removed: \"...\".\n  - \"<param>: replaced \"...\" with \"...\"\" → Node \"X\" — <param> changed from \"...\" to \"...\".\n  - \"<param>: A → B\" (non-text value) → Node \"X\" — <param> changed from A to B.\n  - \"credentials assignment changed.\" → Node \"X\" credentials assignment changed.\n  - \"notes: ...\" → Node \"X\" notes updated.\n- \"Added connections: \"A\" → \"B\", ...\" → one \"added\" bullet per pair: Connection added from \"A\" to \"B\".\n- \"Removed connections: \"A\" → \"B\", ...\" → one \"removed\" bullet per pair: Connection removed from \"A\" to \"B\".\n- \"Field \"X\" changed.\" (not under a node) → one \"changed\" bullet: Workflow-level field \"X\" changed.\n- \"New workflow file (no previous version found in GitLab).\" → summary: \"New workflow file added to GitLab.\"; leave added/changed/removed empty unless Added nodes/connections lines are also present.\n- \"Workflow content changed (no structural diff detected — likely formatting/metadata only).\" → summary: \"Workflow updated (formatting/metadata only).\"; leave all three arrays empty.\n\nSTRICT RULES:\n1. Every bullet must correspond 1:1 to a line literally present above. Never invent a node name, parameter, value, count, ordering, or reason not literally in that text.\n2. Never merge unrelated lines into one narrative. Only describe a node as both \"re-enabled\" and \"reconnected\" if BOTH a disabled-line AND a connections-line are separately present for it — do not combine them from imagination.\n3. Do not add commentary about why a change was made, its impact, or your interpretation of intent. State only what changed.\n4. If Detected changes is empty, blank, or only the \"no structural diff\" fallback line, return added: [], changed: [], removed: [], summary: \"Workflow updated.\"\n5. \"summary\" must be built only from bullets you already generated in added/changed/removed — never introduce a new fact in the summary.\n6. No Markdown headings, no timestamps, no text outside the structured fields.\n\nTransform the Detected changes above into the three categorized arrays plus the one-sentence summary now."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        4176,
+        5968
+      ],
+      "id": "17d20271-f1d8-418b-8ff6-af86732820de",
+      "name": "AI Agent",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "deepseek/deepseek-v4-flash",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        4176,
+        6256
+      ],
+      "id": "4607d413-a99f-4e1f-a7f3-e476b952ffa6",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenRouter API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"summary\": {\n      \"type\": \"string\",\n      \"description\": \"One-line plain-English summary of the overall change, no markdown\"\n    },\n    \"added\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"Bullet points describing newly added nodes or connections\"\n    },\n    \"changed\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"Bullet points describing modified nodes/parameters, node name + what changed\"\n    },\n    \"removed\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"Bullet points describing removed nodes or connections\"\n    }\n  },\n  \"required\": [\n    \"summary\",\n    \"added\",\n    \"changed\",\n    \"removed\"\n  ]\n}",
+        "autoFix": true
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        4240,
+        6480
+      ],
+      "id": "5cd526a3-e765-4680-bedc-ebcf8471c838",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "model": "deepseek/deepseek-v4-flash",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        4240,
+        6672
+      ],
+      "id": "b1d3ed0b-d9ff-44a6-855e-8b132d451f40",
+      "name": "OpenRouter Chat Model1",
+      "credentials": {
+        "openRouterApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenRouter API Credential"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const config = $('Set GitLab Config').first().json;\nconst ROOT_FULL_PATH = config.GITLAB_ROOT_FULL_PATH;\nconst ROOT_GROUP_ID = config.GITLAB_ROOT_GROUP_ID;\nconst GITLAB_URL = config.GITLAB_URL;\n\nconst headerValue = config.GITLAB_PRIVATE_TOKEN;\n\nconst authHeaders = {\n  'PRIVATE-TOKEN': headerValue,\n};\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const segments = item.json.folderSegments || [];\n\n  let currentFullPath = ROOT_FULL_PATH;\n  let currentGroupId = ROOT_GROUP_ID;\n\n  for (const segment of segments) {\n    const pathSegment = segment\n      .toLowerCase()\n      .trim()\n      .replace(/[^a-z0-9]+/g, '-')\n      .replace(/^-+|-+$/g, '')\n      .replace(/-+/g, '-');\n\n    const nextFullPath = `${currentFullPath}/${pathSegment}`;\n\n    currentGroupId = await resolveOrCreateGroup.call(\n      this,\n      nextFullPath,\n      currentGroupId,\n      segment\n    );\n\n    currentFullPath = nextFullPath;\n  }\n\n  results.push({\n    json: {\n      ...item.json,\n      namespaceFullPath: currentFullPath,\n      namespaceId: currentGroupId,\n    },\n  });\n}\n\nreturn results;\n\nasync function resolveOrCreateGroup(\n  fullPath,\n  parentId,\n  originalName\n) {\n\n  const getRes = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `${GITLAB_URL}/api/v4/groups/${encodeURIComponent(fullPath)}`,\n    headers: authHeaders,\n    json: true,\n    ignoreHttpStatusErrors: true,\n    returnFullResponse: true,\n  });\n\n  if (getRes.statusCode === 200 && getRes.body && getRes.body.id) {\n    return getRes.body.id;\n  }\n\n  if (getRes.statusCode !== 404) {\n    throw new Error(\n      `Cannot resolve GitLab group \"${fullPath}\". ` +\n      `HTTP ${getRes.statusCode}: ${JSON.stringify(getRes.body)}`\n    );\n  }\n\n  const path = originalName\n    .toLowerCase()\n    .trim()\n    .replace(/[^a-z0-9]+/g, '-')\n    .replace(/^-+|-+$/g, '')\n    .replace(/-+/g, '-');\n\n  let safeName = originalName\n    .trim()\n    .replace(/[^a-zA-Z0-9_\\.\\- ()]/g, '-')\n    .replace(/-+/g, '-')\n    .trim();\n\n  if (!/^[a-zA-Z0-9_]/.test(safeName)) {\n    safeName = 'g-' + safeName;\n  }\n  if (!path) {\n    throw new Error(\n      `Cannot create GitLab subgroup from folder name \"${originalName}\".`\n    );\n  }\n\n  const body = {\n    name: safeName || path,\n    path: path,\n    visibility: 'private',\n    parent_id: parentId,\n    project_creation_level: 'maintainer',\n  };\n\n  const createRes = await this.helpers.httpRequest({\n    method: 'POST',\n    url: `${GITLAB_URL}/api/v4/groups`,\n    headers: authHeaders,\n    body: body,\n    json: true,\n    ignoreHttpStatusErrors: true,\n    returnFullResponse: true,\n  });\n\n  if (createRes.statusCode === 201 && createRes.body && createRes.body.id) {\n    return createRes.body.id;\n  }\n\n  if (createRes.statusCode === 400) {\n    const errorBody = JSON.stringify(createRes.body);\n\n    if (errorBody.includes('already been taken')) {\n      const retryRes = await this.helpers.httpRequest({\n        method: 'GET',\n        url: `${GITLAB_URL}/api/v4/groups/${encodeURIComponent(fullPath)}`,\n        headers: authHeaders,\n        json: true,\n        ignoreHttpStatusErrors: true,\n        returnFullResponse: true,\n      });\n\n      if (retryRes.statusCode === 200 && retryRes.body && retryRes.body.id) {\n        return retryRes.body.id;\n      }\n    }\n  }\n\n  throw new Error(\n    `Failed to create GitLab group \"${fullPath}\". ` +\n    `HTTP ${createRes.statusCode}: ${JSON.stringify(createRes.body)}`\n  );\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        6992
+      ],
+      "id": "ddd291db-7f02-430f-9439-d69772b9c588",
+      "name": "Resolve GitLab subgroup path",
+      "notes": "Walks <your GITLAB_ROOT_FULL_PATH>/<folderPath from n8n_backup.sh tree>, creating any missing subgroups via POST /api/v4/groups, and returns namespaceId + namespaceFullPath to use for the project itself. Requires ROOT_FULL_PATH group to already exist."
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $(\"GET workflow by ID\").all();\nconst treeItems = $(\"Parse n8n tree\").all();\n\nreturn items.map((item, index) => {\n  const original = item.json.name;\n\n  const slug = original\n    .toLowerCase()\n    .replace(/[\\/\\\\]/g, '-')\n    .replace(/[^a-z0-9]+/g, '-')\n    .replace(/^-+|-+$/g, '')\n    .replace(/-{2,}/g, '-');\n\n  const treeMatch =\n    treeItems.find(t => t.json.workflowId === item.json.id) ||\n    treeItems[index];\n\n  const folderPath = treeMatch?.json.folderPath || '';\n  const folderSegments = folderPath\n    ? folderPath.split('/').filter(Boolean)\n    : [];\n\n  return {\n    json: {\n      ...item.json,\n      originalName: original,\n      slug,\n      folderPath,\n      folderSegments\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        96,
+        6992
+      ],
+      "id": "88464ace-1282-4fbb-ac18-8460e81e012d",
+      "name": "Prepare workflow"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ encodeURIComponent($json.namespaceFullPath + '/' + $json.slug) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        560,
+        6992
+      ],
+      "id": "d2fe95b3-4e2b-4e1e-80b4-d21dc79edf35",
+      "name": "Check if project exists in Gitlab",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GitLab API Credential (alt)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        6016,
+        7040
+      ],
+      "id": "c8058a43-f117-412c-8408-3a061202acc6",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1104,
+        6992
+      ],
+      "id": "7a7b0794-00e0-4c06-ac6c-7afbfb5814ce",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "2a915f3c-3f11-48c5-ae69-dcb0ac430741",
+              "name": "GITLAB_URL",
+              "value": "https://gitlab.example.com",
+              "type": "string"
+            },
+            {
+              "id": "53b4c2d4-eb1b-42ed-abac-265b6f709abf",
+              "name": "GITLAB_ROOT_FULL_PATH",
+              "value": "yourgroup/n8n-backups",
+              "type": "string"
+            },
+            {
+              "id": "d7c676c7-1da6-4479-9717-0585ead9a473",
+              "name": "GITLAB_ROOT_GROUP_ID",
+              "value": "0",
+              "type": "number"
+            },
+            {
+              "id": "24074744-bb55-49f0-95ba-ba18de864d83",
+              "name": "N8N_ROOT_FOLDER_ID",
+              "value": "YOUR_N8N_FOLDER_ID",
+              "type": "string"
+            },
+            {
+              "id": "6d9ad64b-c135-47b9-8f70-51591f3c704f",
+              "name": "GITLAB_PRIVATE_TOKEN",
+              "value": "YOUR_GITLAB_TOKEN",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1000,
+        6992
+      ],
+      "id": "d31a62e9-6db1-4fa1-8593-9d66d61aaef7",
+      "name": "Set GitLab Config",
+      "notes": "Fill in your own GitLab URL, group path/ID, n8n root folder ID and GitLab token here. Never commit this workflow with real values filled in — only share/version it with placeholders."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "n8n_backup.sh": {
+      "main": [
+        [
+          {
+            "node": "Parse n8n tree",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch matching file from GitLab1": {
+      "main": [
+        [
+          {
+            "node": "Diff workflow JSON1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff workflow JSON1": {
+      "main": [
+        [
+          {
+            "node": "Create arrays1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update JSON1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "if all of them have repo1": {
+      "main": [
+        [
+          {
+            "node": "per Item2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "division1": {
+      "main": [
+        [
+          {
+            "node": "if all of them have repo1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Create repo1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create repo1": {
+      "main": [
+        [
+          {
+            "node": "Wait2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait2": {
+      "main": [
+        [
+          {
+            "node": "Prepare workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if file exists1": {
+      "main": [
+        [
+          {
+            "node": "Divide based on file exsistance1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "per Item2": {
+      "main": [
+        [
+          {
+            "node": "Check if file exists1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Divide based on file exsistance1": {
+      "main": [
+        [
+          {
+            "node": "If all of them have file1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If all of them have file1": {
+      "main": [
+        [
+          {
+            "node": "per Item3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split Out4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out4": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Create Release1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait3": {
+      "main": [
+        [
+          {
+            "node": "Unprotect dev",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "per Item3": {
+      "main": [
+        [
+          {
+            "node": "fetch matching file from GitLab1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create arrays1": {
+      "main": [
+        [
+          {
+            "node": "If no need to upload1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If no need to upload1": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Split Out5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out5": {
+      "main": [
+        [
+          {
+            "node": "Update JSON1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unprotect dev": {
+      "main": [
+        [
+          {
+            "node": "per Item2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Release1": {
+      "main": [
+        [
+          {
+            "node": "Wait3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get existing changelog1": {
+      "main": [
+        [
+          {
+            "node": "Build changelog entry1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build changelog entry1": {
+      "main": [
+        [
+          {
+            "node": "Changelog exists?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changelog exists?1": {
+      "main": [
+        [
+          {
+            "node": "Update CHANGELOG.md1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create CHANGELOG.md1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update CHANGELOG.md1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create CHANGELOG.md1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Parse n8n tree": {
+      "main": [
+        [
+          {
+            "node": "GET workflow by ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET workflow by ID": {
+      "main": [
+        [
+          {
+            "node": "Prepare workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Get existing changelog1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Structured Output Parser",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare workflow": {
+      "main": [
+        [
+          {
+            "node": "Resolve GitLab subgroup path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve GitLab subgroup path": {
+      "main": [
+        [
+          {
+            "node": "Check if project exists in Gitlab",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if project exists in Gitlab": {
+      "main": [
+        [
+          {
+            "node": "division1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "per Item3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set GitLab Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set GitLab Config": {
+      "main": [
+        [
+          {
+            "node": "n8n_backup.sh",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
