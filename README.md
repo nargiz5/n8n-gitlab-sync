@@ -85,7 +85,7 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
 
 ## Setup
 
-1. **Import the workflow.** Download [`Gitlab-n8n-synchronization-prod.json`](./Gitlab-n8n-synchronization-prod.json) and import it into your n8n instance.
+1. **Import the workflow.** Download [`Gitlab-n8n-synchronization-prod.json`](./workflow/Gitlab-n8n-synchronization-prod.json) and import it into your n8n instance.
 
 2. **Reconnect credentials** in n8n. Every node's credential reference was stripped when this was published, so each `HTTP Request`, `SSH`, and `OpenRouter` node will show as unlinked after import — open each one and pick (or create) your own:
 
