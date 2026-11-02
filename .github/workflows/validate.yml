@@ -1,0 +1,16 @@
+name: Validate workflow JSON
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check workflow JSON is valid
+        run: for f in workflow/*.json; do python3 -m json.tool "$f" > /dev/null; done
+      - name: Check no real GitLab token is committed
+        run: "! grep -rE 'glpat-[A-Za-z0-9_-]{20}' --include='*.json' --include='*.md' ."
