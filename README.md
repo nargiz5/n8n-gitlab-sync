@@ -26,7 +26,11 @@ Read workflow tree from n8n's Postgres DB (via SSH)
      ▼
 For each workflow:
   ├─ Does a matching GitLab project exist?
-  │    No  → create project, seed CHANGELOG.md
+  │    No  → create project (default branch: dev), seed CHANGELOG.md
+  │    Yes → continue
+  ├─ Does the workflow JSON file exist on dev?
+  │    No  → create it, create a release branch from dev,
+  │          remove the default protection from dev
   │    Yes → continue
   ├─ Fetch current file from GitLab
   ├─ Diff against n8n's current version (noise-filtered)
@@ -35,6 +39,12 @@ For each workflow:
         ├─ Commit updated JSON to GitLab
         └─ Send diff to AI Agent → append entry to CHANGELOG.md
 ```
+
+### Branches and branch protection
+
+New projects use `dev` as their default branch, and every sync commits to `dev`. When a workflow file is created for the first time, the workflow also creates a `release` branch from `dev` and then removes GitLab's automatic protection from `dev` (`DELETE /projects/:id/protected_branches/dev`), so the sync token can keep committing to it.
+
+This means anyone with Developer access to these projects can push to `dev` directly. Treat `release` as the reviewed branch: protect it, and promote changes from `dev` to `release` through merge requests. If your GitLab policy does not allow unprotected default branches, remove the `Unprotect dev` node and give the sync token a role that is allowed to push to protected branches instead.
 
 ### Why SSH instead of the REST API
 
