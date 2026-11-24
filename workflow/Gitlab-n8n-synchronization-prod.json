@@ -931,6 +931,30 @@
       "id": "d31a62e9-6db1-4fa1-8593-9d66d61aaef7",
       "name": "Set GitLab Config",
       "notes": "Fill in your own GitLab URL, group path/ID, n8n root folder ID and GitLab token here. Never commit this workflow with real values filled in — only share/version it with placeholders."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "n8n-gitlab-sync",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        7184
+      ],
+      "id": "3c1f6a2e-8d4b-4f7a-9e2c-5b8d0a6f1e47",
+      "name": "Webhook Trigger",
+      "webhookId": "9d2e4b7a-1c3f-4e8a-b6d5-0f7a2c9e4b81",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Webhook Header Auth"
+        }
+      },
+      "notes": "Call this with POST and the header from the Webhook Header Auth credential to run the sync right after a change, instead of waiting for the schedule."
     }
   ],
   "pinData": {},
@@ -1385,9 +1409,20 @@
           }
         ]
       ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set GitLab Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
-  "active": true,
+  "active": false,
   "settings": {
     "executionOrder": "v1",
     "binaryMode": "separate",
