@@ -104,7 +104,7 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
    | HTTP Header Auth (`PRIVATE-TOKEN: <your GitLab token>`) | All GitLab `HTTP Request` nodes | Creating/reading/writing GitLab projects and files |
    | HTTP Header Auth | `GET workflow by ID` | Authenticating against your own n8n instance's REST API |
    | HTTP Header Auth (a secret header of your choice) | `Webhook Trigger` | Only callers that send this header can start a sync |
-   | SSH Private Key | `n8n_backup.sh` | Connecting to the Postgres host to read the folder tree |
+   | SSH Private Key | `Read folder tree from Postgres` | Connecting to the Postgres host to read the folder tree |
    | OpenRouter API | Both `OpenRouter Chat Model` nodes | Generating changelog entries |
 
 3. **Fill in the `Set GitLab Config` node.** This is the first node after the trigger, and it's the single place all the GitLab/n8n config values live — nothing else in the workflow should need editing besides this node and the credentials above.

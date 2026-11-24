@@ -13,7 +13,7 @@
         6992
       ],
       "id": "6bb73649-bea6-4a1b-ac5c-4275ac1f0094",
-      "name": "n8n_backup.sh",
+      "name": "Read folder tree from Postgres",
       "credentials": {
         "sshPrivateKey": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -56,7 +56,7 @@
         6400
       ],
       "id": "3aa551cf-046a-46e7-907d-16abe89f13a4",
-      "name": "fetch matching file from GitLab1",
+      "name": "Fetch current file from GitLab",
       "alwaysOutputData": true,
       "credentials": {
         "httpHeaderAuth": {
@@ -68,7 +68,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\n\nfunction stableStringify(obj) {\n  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);\n  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';\n  const keys = Object.keys(obj).sort();\n  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';\n}\n\n// Shows exactly what text was inserted/removed instead of dumping full before/after blobs.\nfunction stringDiff(oldStr, newStr) {\n  let start = 0;\n  const maxStart = Math.min(oldStr.length, newStr.length);\n  while (start < maxStart && oldStr[start] === newStr[start]) start++;\n\n  let endOld = oldStr.length, endNew = newStr.length;\n  while (endOld > start && endNew > start && oldStr[endOld - 1] === newStr[endNew - 1]) {\n    endOld--; endNew--;\n  }\n\n  const removed = oldStr.slice(start, endOld);\n  const added = newStr.slice(start, endNew);\n\n  if (!removed && added) return `added text: \"${added}\"`;\n  if (removed && !added) return `removed text: \"${removed}\"`;\n  if (removed && added) return `replaced \"${removed}\" with \"${added}\"`;\n  return 'value changed (no textual diff detected)';\n}\n\nfunction trim(v, max = 120) {\n  if (v === undefined) return 'undefined';\n  return v.length > max ? v.slice(0, max) + '\\u2026' : v;\n}\n\n// Fields n8n auto-touches on nearly every save/drag with no real semantic change.\nconst NODE_NOISE_KEYS = new Set(['position', 'versionCounter', 'id', 'webhookId']);\n\n// n8n masks/rotates credential IDs for credentials the API caller doesn't directly\n// own or that are shared/placeholder (\"test-temp-XXX\") — the id can differ on every\n// single fetch even though the actual assignment never changed. Only the credential\n// *name* is a stable signal of a real reassignment, so we compare on name only.\nfunction normalizeCredentials(creds) {\n  if (!creds || typeof creds !== 'object') return creds;\n  const out = {};\n  Object.keys(creds).sort().forEach(type => {\n    const c = creds[type] || {};\n    out[type] = { name: c.name };\n  });\n  return out;\n}\n\nfunction nodesEqualIgnoringNoise(oldNode, newNode) {\n  const stripNoise = (n) => {\n    const c = { ...n };\n    NODE_NOISE_KEYS.forEach(k => delete c[k]);\n    if (c.credentials) c.credentials = normalizeCredentials(c.credentials);\n    return c;\n  };\n  return stableStringify(stripNoise(oldNode)) === stableStringify(stripNoise(newNode));\n}\n\nfunction diffParams(oldNode, newNode) {\n  const changes = [];\n  const oldParams = (oldNode && oldNode.parameters) || {};\n  const newParams = (newNode && newNode.parameters) || {};\n  const allKeys = new Set([...Object.keys(oldParams), ...Object.keys(newParams)]);\n\n  allKeys.forEach(key => {\n    const oldRaw = oldParams[key];\n    const newRaw = newParams[key];\n    const oldStr = stableStringify(oldRaw);\n    const newStr = stableStringify(newRaw);\n    if (oldStr === newStr) return;\n\n    if (typeof oldRaw === 'string' && typeof newRaw === 'string') {\n      changes.push(`${key}: ${stringDiff(oldRaw, newRaw)}`);\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\nfunction diffNodeFields(oldNode, newNode) {\n  const changes = [];\n  const keys = new Set([...Object.keys(oldNode || {}), ...Object.keys(newNode || {})]);\n\n  keys.forEach(key => {\n    if (key === 'parameters' || NODE_NOISE_KEYS.has(key)) return;\n    const oldVal = oldNode ? oldNode[key] : undefined;\n    const newVal = newNode ? newNode[key] : undefined;\n    const oldStr = stableStringify(oldVal);\n    const newStr = stableStringify(newVal);\n    if (oldStr === newStr) return;\n\n    if (key === 'disabled') {\n      changes.push(newVal === true ? 'Node deactivated (disabled in n8n).' : 'Node re-activated (enabled in n8n).');\n    } else if (key === 'notes') {\n      if (typeof oldVal === 'string' && typeof newVal === 'string') {\n        changes.push(`notes: ${stringDiff(oldVal, newVal)}`);\n      } else {\n        changes.push('notes updated.');\n      }\n    } else if (key === 'credentials') {\n      const oldNorm = normalizeCredentials(oldVal);\n      const newNorm = normalizeCredentials(newVal);\n      if (stableStringify(oldNorm) !== stableStringify(newNorm)) {\n        changes.push('credentials assignment changed.');\n      }\n      // else: only the (rotating/masked) id differed — not a real change, skip.\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\n// ---- Connection (edge) level diffing ----\nfunction flattenConnections(connections) {\n  const edges = [];\n  Object.keys(connections || {}).forEach(sourceName => {\n    const outputTypes = connections[sourceName] || {};\n    Object.keys(outputTypes).forEach(outputType => {\n      const branches = outputTypes[outputType] || [];\n      branches.forEach((branch, outputIndex) => {\n        (branch || []).forEach(conn => {\n          if (!conn) return;\n          edges.push({\n            source: sourceName,\n            outputType,\n            outputIndex,\n            target: conn.node,\n            targetInputType: conn.type,\n            targetInputIndex: conn.index\n          });\n        });\n      });\n    });\n  });\n  return edges;\n}\n\nfunction edgeKey(e) {\n  return `${e.source}|${e.outputType}|${e.outputIndex}|${e.target}|${e.targetInputType}|${e.targetInputIndex}`;\n}\n\nfunction diffConnections(oldConn, newConn) {\n  const oldEdges = flattenConnections(oldConn);\n  const newEdges = flattenConnections(newConn);\n  const oldMap = new Map(oldEdges.map(e => [edgeKey(e), e]));\n  const newMap = new Map(newEdges.map(e => [edgeKey(e), e]));\n\n  const added = [];\n  const removed = [];\n\n  newMap.forEach((e, k) => {\n    if (!oldMap.has(k)) added.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n  oldMap.forEach((e, k) => {\n    if (!newMap.has(k)) removed.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n\n  return { added, removed };\n}\n\nfunction summarizeChanges(oldWf, newWf) {\n  if (!oldWf) return ['New workflow file (no previous version found in GitLab).'];\n  const lines = [];\n\n  const oldNodes = Array.isArray(oldWf.nodes) ? oldWf.nodes : [];\n  const newNodes = Array.isArray(newWf.nodes) ? newWf.nodes : [];\n  const oldById = new Map(oldNodes.map(n => [n.name || n.id, n]));\n  const newById = new Map(newNodes.map(n => [n.name || n.id, n]));\n\n  const added = [];\n  const removed = [];\n  const modified = [];\n\n  newById.forEach((node, id) => {\n    if (!oldById.has(id)) {\n      added.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    } else {\n      const oldNode = oldById.get(id);\n      if (!nodesEqualIgnoringNoise(oldNode, node)) {\n        const paramChanges = diffParams(oldNode, node);\n        const fieldChanges = diffNodeFields(oldNode, node);\n        modified.push({ name: node.name || id, type: node.type || 'unknown type', paramChanges, fieldChanges });\n      }\n    }\n  });\n\n  oldById.forEach((node, id) => {\n    if (!newById.has(id)) {\n      removed.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    }\n  });\n\n  if (added.length) lines.push(`Added nodes: ${added.join(', ')}`);\n  if (removed.length) lines.push(`Removed nodes: ${removed.join(', ')}`);\n  if (modified.length) {\n    modified.forEach(m => {\n      lines.push(`Modified node \"${m.name}\" (${m.type}):`);\n      const allChanges = [...m.fieldChanges, ...m.paramChanges];\n      if (allChanges.length) {\n        allChanges.forEach(c => lines.push(`  - ${c}`));\n      } else {\n        lines.push('  - value changed (details not detected)');\n      }\n    });\n  }\n\n  const connDiff = diffConnections(oldWf.connections || {}, newWf.connections || {});\n  if (connDiff.added.length) lines.push(`Added connections: ${connDiff.added.join(', ')}`);\n  if (connDiff.removed.length) lines.push(`Removed connections: ${connDiff.removed.join(', ')}`);\n\n  const skip = new Set(['nodes', 'connections']);\n  Object.keys(newWf || {}).forEach(key => {\n    if (skip.has(key)) return;\n    const oldVal = oldWf ? oldWf[key] : undefined;\n    const newVal = newWf[key];\n    if (stableStringify(oldVal) !== stableStringify(newVal)) {\n      lines.push(`Field \"${key}\" changed.`);\n    }\n  });\n\n  if (lines.length === 0) lines.push('Workflow content changed (no structural diff detected \\u2014 likely formatting/metadata only).');\n\n  return lines;\n}\n\n// FIX: when two different workflows share the same slug (e.g. \"check_webhooks_backup\"\n// and \"check_webhooks-backup\" both become \"check-webhooks-backup\"), they keep\n// overwriting the same GitLab file in a \"tennis match\" and isDifferent never\n// settles. Detect this early and raise a warning/error.\nconst perItem3All = $('per Item3').all();\nconst slugCounts = {};\nperItem3All.forEach(p => {\n  const s = p.json.slug;\n  if (!s) return;\n  slugCounts[s] = (slugCounts[s] || 0) + 1;\n});\nconst duplicateSlugs = Object.keys(slugCounts).filter(s => slugCounts[s] > 1);\nif (duplicateSlugs.length) {\n  throw new Error(\n    `Slug collision detected — multiple workflows map to the same GitLab file and will ` +\n    `overwrite each other forever: ${duplicateSlugs.join(', ')}. Rename one of the ` +\n    `colliding n8n workflows so their slugs become unique before syncing.`\n  );\n}\n\nreturn items.map((item, index) => {\n  // FIX: if the item already carries n8nWorkflow (loop-back), use it directly;\n  // otherwise (first pass) match it from Prepare workflow by a stable key (projectId/slug).\n  // Matching by index is unreliable because the HTTP node in between uses batching +\n  // continueRegularOutput, so the order can differ between executions.\n  const matchByKey = (arr) => arr.find(p =>\n    (item.json.projectId !== undefined && p.json.projectId === item.json.projectId) ||\n    (item.json.slug !== undefined && p.json.slug === item.json.slug)\n  );\n\n  const n8nWorkflow = item.json.n8nWorkflow\n    || matchByKey(perItem3All)?.json\n    || perItem3All[index].json;\n\n  const projectId = item.json.projectId\n    || matchByKey(perItem3All)?.json?.projectId\n    || perItem3All[index].json.projectId;\n\n  const workflowName = n8nWorkflow.originalName || n8nWorkflow.name;\n\n  let gitlabContent;\n  try {\n    // With fullResponse:true, the n8n HTTP Request node returns the response in item.json.body,\n    // not item.json.data. The previous code always read data, so gitlabContent\n    // was always null and every file looked new (isDifferent=true).\n    const rawData = item.json.body !== undefined ? item.json.body : item.json.data;\n    gitlabContent = typeof rawData === 'string'\n      ? JSON.parse(rawData)\n      : rawData;\n  } catch (e) {\n    gitlabContent = null;\n  }\n\n  const volatileKeys = [\n    'updatedAt', 'createdAt', 'versionId', 'activeVersionId', 'activeVersion',\n    'shared', 'meta', 'slug', 'originalName', 'id', 'triggerCount',\n    'isArchived', 'active', 'tags', 'pinData', 'staticData', 'versionCounter'\n  ];\n\n  const stripVolatile = (wf) => {\n    if (!wf) return null;\n    const clean = { ...wf };\n    volatileKeys.forEach(k => delete clean[k]);\n    return clean;\n  };\n\n  const stripNodeNoise = (wf) => {\n    if (!wf || !Array.isArray(wf.nodes)) return wf;\n    const clone = { ...wf };\n    clone.nodes = wf.nodes.map(node => {\n      const n = { ...node };\n      NODE_NOISE_KEYS.forEach(k => delete n[k]);\n      return n;\n    });\n    return clone;\n  };\n\n  const cleanGitlab = stripNodeNoise(stripVolatile(gitlabContent));\n  const cleanN8n = stripNodeNoise(stripVolatile(n8nWorkflow));\n\n  const gitlabStr = stableStringify(cleanGitlab);\n  const n8nStr = stableStringify(cleanN8n);\n  const isDifferent = gitlabStr !== n8nStr;\n\n  const changeSummary = isDifferent ? summarizeChanges(cleanGitlab, cleanN8n) : [];\n  const changeSummaryText = changeSummary.map(l => `- ${l}`).join('\\n');\n\n  return {\n    json: {\n      workflowName,\n      slug: n8nWorkflow.slug,\n      projectId,\n      n8nWorkflow,\n      isDifferent,\n      changeSummary,\n      changeSummaryText,\n      diffCheckedAt: new Date().toISOString(),\n      debug: {\n        gitlabContentWasNull: gitlabContent === null,\n        gitlabKeys: cleanGitlab ? Object.keys(cleanGitlab).sort() : [],\n        n8nKeys: cleanN8n ? Object.keys(cleanN8n).sort() : []\n      }\n    }\n  };\n});"
+        "jsCode": "const items = $input.all();\n\nfunction stableStringify(obj) {\n  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);\n  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';\n  const keys = Object.keys(obj).sort();\n  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';\n}\n\n// Shows exactly what text was inserted/removed instead of dumping full before/after blobs.\nfunction stringDiff(oldStr, newStr) {\n  let start = 0;\n  const maxStart = Math.min(oldStr.length, newStr.length);\n  while (start < maxStart && oldStr[start] === newStr[start]) start++;\n\n  let endOld = oldStr.length, endNew = newStr.length;\n  while (endOld > start && endNew > start && oldStr[endOld - 1] === newStr[endNew - 1]) {\n    endOld--; endNew--;\n  }\n\n  const removed = oldStr.slice(start, endOld);\n  const added = newStr.slice(start, endNew);\n\n  if (!removed && added) return `added text: \"${added}\"`;\n  if (removed && !added) return `removed text: \"${removed}\"`;\n  if (removed && added) return `replaced \"${removed}\" with \"${added}\"`;\n  return 'value changed (no textual diff detected)';\n}\n\nfunction trim(v, max = 120) {\n  if (v === undefined) return 'undefined';\n  return v.length > max ? v.slice(0, max) + '\\u2026' : v;\n}\n\n// Fields n8n auto-touches on nearly every save/drag with no real semantic change.\nconst NODE_NOISE_KEYS = new Set(['position', 'versionCounter', 'id', 'webhookId']);\n\n// n8n masks/rotates credential IDs for credentials the API caller doesn't directly\n// own or that are shared/placeholder (\"test-temp-XXX\") — the id can differ on every\n// single fetch even though the actual assignment never changed. Only the credential\n// *name* is a stable signal of a real reassignment, so we compare on name only.\nfunction normalizeCredentials(creds) {\n  if (!creds || typeof creds !== 'object') return creds;\n  const out = {};\n  Object.keys(creds).sort().forEach(type => {\n    const c = creds[type] || {};\n    out[type] = { name: c.name };\n  });\n  return out;\n}\n\nfunction nodesEqualIgnoringNoise(oldNode, newNode) {\n  const stripNoise = (n) => {\n    const c = { ...n };\n    NODE_NOISE_KEYS.forEach(k => delete c[k]);\n    if (c.credentials) c.credentials = normalizeCredentials(c.credentials);\n    return c;\n  };\n  return stableStringify(stripNoise(oldNode)) === stableStringify(stripNoise(newNode));\n}\n\nfunction diffParams(oldNode, newNode) {\n  const changes = [];\n  const oldParams = (oldNode && oldNode.parameters) || {};\n  const newParams = (newNode && newNode.parameters) || {};\n  const allKeys = new Set([...Object.keys(oldParams), ...Object.keys(newParams)]);\n\n  allKeys.forEach(key => {\n    const oldRaw = oldParams[key];\n    const newRaw = newParams[key];\n    const oldStr = stableStringify(oldRaw);\n    const newStr = stableStringify(newRaw);\n    if (oldStr === newStr) return;\n\n    if (typeof oldRaw === 'string' && typeof newRaw === 'string') {\n      changes.push(`${key}: ${stringDiff(oldRaw, newRaw)}`);\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\nfunction diffNodeFields(oldNode, newNode) {\n  const changes = [];\n  const keys = new Set([...Object.keys(oldNode || {}), ...Object.keys(newNode || {})]);\n\n  keys.forEach(key => {\n    if (key === 'parameters' || NODE_NOISE_KEYS.has(key)) return;\n    const oldVal = oldNode ? oldNode[key] : undefined;\n    const newVal = newNode ? newNode[key] : undefined;\n    const oldStr = stableStringify(oldVal);\n    const newStr = stableStringify(newVal);\n    if (oldStr === newStr) return;\n\n    if (key === 'disabled') {\n      changes.push(newVal === true ? 'Node deactivated (disabled in n8n).' : 'Node re-activated (enabled in n8n).');\n    } else if (key === 'notes') {\n      if (typeof oldVal === 'string' && typeof newVal === 'string') {\n        changes.push(`notes: ${stringDiff(oldVal, newVal)}`);\n      } else {\n        changes.push('notes updated.');\n      }\n    } else if (key === 'credentials') {\n      const oldNorm = normalizeCredentials(oldVal);\n      const newNorm = normalizeCredentials(newVal);\n      if (stableStringify(oldNorm) !== stableStringify(newNorm)) {\n        changes.push('credentials assignment changed.');\n      }\n      // else: only the (rotating/masked) id differed — not a real change, skip.\n    } else {\n      changes.push(`${key}: ${trim(oldStr)} \\u2192 ${trim(newStr)}`);\n    }\n  });\n\n  return changes;\n}\n\n// ---- Connection (edge) level diffing ----\nfunction flattenConnections(connections) {\n  const edges = [];\n  Object.keys(connections || {}).forEach(sourceName => {\n    const outputTypes = connections[sourceName] || {};\n    Object.keys(outputTypes).forEach(outputType => {\n      const branches = outputTypes[outputType] || [];\n      branches.forEach((branch, outputIndex) => {\n        (branch || []).forEach(conn => {\n          if (!conn) return;\n          edges.push({\n            source: sourceName,\n            outputType,\n            outputIndex,\n            target: conn.node,\n            targetInputType: conn.type,\n            targetInputIndex: conn.index\n          });\n        });\n      });\n    });\n  });\n  return edges;\n}\n\nfunction edgeKey(e) {\n  return `${e.source}|${e.outputType}|${e.outputIndex}|${e.target}|${e.targetInputType}|${e.targetInputIndex}`;\n}\n\nfunction diffConnections(oldConn, newConn) {\n  const oldEdges = flattenConnections(oldConn);\n  const newEdges = flattenConnections(newConn);\n  const oldMap = new Map(oldEdges.map(e => [edgeKey(e), e]));\n  const newMap = new Map(newEdges.map(e => [edgeKey(e), e]));\n\n  const added = [];\n  const removed = [];\n\n  newMap.forEach((e, k) => {\n    if (!oldMap.has(k)) added.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n  oldMap.forEach((e, k) => {\n    if (!newMap.has(k)) removed.push(`\"${e.source}\" \\u2192 \"${e.target}\"`);\n  });\n\n  return { added, removed };\n}\n\nfunction summarizeChanges(oldWf, newWf) {\n  if (!oldWf) return ['New workflow file (no previous version found in GitLab).'];\n  const lines = [];\n\n  const oldNodes = Array.isArray(oldWf.nodes) ? oldWf.nodes : [];\n  const newNodes = Array.isArray(newWf.nodes) ? newWf.nodes : [];\n  const oldById = new Map(oldNodes.map(n => [n.name || n.id, n]));\n  const newById = new Map(newNodes.map(n => [n.name || n.id, n]));\n\n  const added = [];\n  const removed = [];\n  const modified = [];\n\n  newById.forEach((node, id) => {\n    if (!oldById.has(id)) {\n      added.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    } else {\n      const oldNode = oldById.get(id);\n      if (!nodesEqualIgnoringNoise(oldNode, node)) {\n        const paramChanges = diffParams(oldNode, node);\n        const fieldChanges = diffNodeFields(oldNode, node);\n        modified.push({ name: node.name || id, type: node.type || 'unknown type', paramChanges, fieldChanges });\n      }\n    }\n  });\n\n  oldById.forEach((node, id) => {\n    if (!newById.has(id)) {\n      removed.push(`${node.name || id} (${node.type || 'unknown type'})`);\n    }\n  });\n\n  if (added.length) lines.push(`Added nodes: ${added.join(', ')}`);\n  if (removed.length) lines.push(`Removed nodes: ${removed.join(', ')}`);\n  if (modified.length) {\n    modified.forEach(m => {\n      lines.push(`Modified node \"${m.name}\" (${m.type}):`);\n      const allChanges = [...m.fieldChanges, ...m.paramChanges];\n      if (allChanges.length) {\n        allChanges.forEach(c => lines.push(`  - ${c}`));\n      } else {\n        lines.push('  - value changed (details not detected)');\n      }\n    });\n  }\n\n  const connDiff = diffConnections(oldWf.connections || {}, newWf.connections || {});\n  if (connDiff.added.length) lines.push(`Added connections: ${connDiff.added.join(', ')}`);\n  if (connDiff.removed.length) lines.push(`Removed connections: ${connDiff.removed.join(', ')}`);\n\n  const skip = new Set(['nodes', 'connections']);\n  Object.keys(newWf || {}).forEach(key => {\n    if (skip.has(key)) return;\n    const oldVal = oldWf ? oldWf[key] : undefined;\n    const newVal = newWf[key];\n    if (stableStringify(oldVal) !== stableStringify(newVal)) {\n      lines.push(`Field \"${key}\" changed.`);\n    }\n  });\n\n  if (lines.length === 0) lines.push('Workflow content changed (no structural diff detected \\u2014 likely formatting/metadata only).');\n\n  return lines;\n}\n\n// FIX: when two different workflows share the same slug (e.g. \"check_webhooks_backup\"\n// and \"check_webhooks-backup\" both become \"check-webhooks-backup\"), they keep\n// overwriting the same GitLab file in a \"tennis match\" and isDifferent never\n// settles. Detect this early and raise a warning/error.\nconst perItem3All = $('Existing files').all();\nconst slugCounts = {};\nperItem3All.forEach(p => {\n  const s = p.json.slug;\n  if (!s) return;\n  slugCounts[s] = (slugCounts[s] || 0) + 1;\n});\nconst duplicateSlugs = Object.keys(slugCounts).filter(s => slugCounts[s] > 1);\nif (duplicateSlugs.length) {\n  throw new Error(\n    `Slug collision detected — multiple workflows map to the same GitLab file and will ` +\n    `overwrite each other forever: ${duplicateSlugs.join(', ')}. Rename one of the ` +\n    `colliding n8n workflows so their slugs become unique before syncing.`\n  );\n}\n\nreturn items.map((item, index) => {\n  // FIX: if the item already carries n8nWorkflow (loop-back), use it directly;\n  // otherwise (first pass) match it from Prepare workflow by a stable key (projectId/slug).\n  // Matching by index is unreliable because the HTTP node in between uses batching +\n  // continueRegularOutput, so the order can differ between executions.\n  const matchByKey = (arr) => arr.find(p =>\n    (item.json.projectId !== undefined && p.json.projectId === item.json.projectId) ||\n    (item.json.slug !== undefined && p.json.slug === item.json.slug)\n  );\n\n  const n8nWorkflow = item.json.n8nWorkflow\n    || matchByKey(perItem3All)?.json\n    || perItem3All[index].json;\n\n  const projectId = item.json.projectId\n    || matchByKey(perItem3All)?.json?.projectId\n    || perItem3All[index].json.projectId;\n\n  const workflowName = n8nWorkflow.originalName || n8nWorkflow.name;\n\n  let gitlabContent;\n  try {\n    // With fullResponse:true, the n8n HTTP Request node returns the response in item.json.body,\n    // not item.json.data. The previous code always read data, so gitlabContent\n    // was always null and every file looked new (isDifferent=true).\n    const rawData = item.json.body !== undefined ? item.json.body : item.json.data;\n    gitlabContent = typeof rawData === 'string'\n      ? JSON.parse(rawData)\n      : rawData;\n  } catch (e) {\n    gitlabContent = null;\n  }\n\n  const volatileKeys = [\n    'updatedAt', 'createdAt', 'versionId', 'activeVersionId', 'activeVersion',\n    'shared', 'meta', 'slug', 'originalName', 'id', 'triggerCount',\n    'isArchived', 'active', 'tags', 'pinData', 'staticData', 'versionCounter'\n  ];\n\n  const stripVolatile = (wf) => {\n    if (!wf) return null;\n    const clean = { ...wf };\n    volatileKeys.forEach(k => delete clean[k]);\n    return clean;\n  };\n\n  const stripNodeNoise = (wf) => {\n    if (!wf || !Array.isArray(wf.nodes)) return wf;\n    const clone = { ...wf };\n    clone.nodes = wf.nodes.map(node => {\n      const n = { ...node };\n      NODE_NOISE_KEYS.forEach(k => delete n[k]);\n      return n;\n    });\n    return clone;\n  };\n\n  const cleanGitlab = stripNodeNoise(stripVolatile(gitlabContent));\n  const cleanN8n = stripNodeNoise(stripVolatile(n8nWorkflow));\n\n  const gitlabStr = stableStringify(cleanGitlab);\n  const n8nStr = stableStringify(cleanN8n);\n  const isDifferent = gitlabStr !== n8nStr;\n\n  const changeSummary = isDifferent ? summarizeChanges(cleanGitlab, cleanN8n) : [];\n  const changeSummaryText = changeSummary.map(l => `- ${l}`).join('\\n');\n\n  return {\n    json: {\n      workflowName,\n      slug: n8nWorkflow.slug,\n      projectId,\n      n8nWorkflow,\n      isDifferent,\n      changeSummary,\n      changeSummaryText,\n      diffCheckedAt: new Date().toISOString(),\n      debug: {\n        gitlabContentWasNull: gitlabContent === null,\n        gitlabKeys: cleanGitlab ? Object.keys(cleanGitlab).sort() : [],\n        n8nKeys: cleanN8n ? Object.keys(cleanN8n).sort() : []\n      }\n    }\n  };\n});"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -77,7 +77,7 @@
         6400
       ],
       "id": "eeda9bd0-6d1e-4d2a-b98f-c7c21d2249f8",
-      "name": "Diff workflow JSON1"
+      "name": "Diff workflow JSON"
     },
     {
       "parameters": {
@@ -105,7 +105,7 @@
         6544
       ],
       "id": "b895cd18-1c76-4cdc-8994-d1d023159750",
-      "name": "Update JSON1",
+      "name": "Update workflow file",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -144,7 +144,7 @@
         6992
       ],
       "id": "9a63b6ef-a875-46d0-b1d8-d55af64d332a",
-      "name": "if all of them have repo1"
+      "name": "All projects exist?"
     },
     {
       "parameters": {
@@ -157,7 +157,7 @@
         6992
       ],
       "id": "1957952a-0e1c-408a-bf1a-aafe96855daf",
-      "name": "division1"
+      "name": "Split existing and missing projects"
     },
     {
       "parameters": {
@@ -171,7 +171,7 @@
         7216
       ],
       "id": "cc479172-0512-408f-8f9b-4b25a9855436",
-      "name": "Split Out"
+      "name": "Split Out missing projects"
     },
     {
       "parameters": {
@@ -191,7 +191,7 @@
         7456
       ],
       "id": "6b717002-eafd-4fc2-9fa5-e64f9ead661f",
-      "name": "Create repo1",
+      "name": "Create GitLab project",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -210,7 +210,7 @@
         7712
       ],
       "id": "1eeb0c2c-ba58-490b-a543-74f86a876782",
-      "name": "Wait2",
+      "name": "Wait for new projects",
       "webhookId": "69b84324-00d2-4786-931a-ab8fa7c0baad"
     },
     {
@@ -242,7 +242,7 @@
         6800
       ],
       "id": "b4f42621-b31f-4b2e-b602-9a8dea9c1c92",
-      "name": "Check if file exists1",
+      "name": "Check if file exists",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -253,7 +253,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const existing = $(\"if all of them have repo1\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
+        "jsCode": "const existing = $(\"All projects exist?\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -262,11 +262,11 @@
         6800
       ],
       "id": "f8bbef65-5a72-44ac-bb8e-4711a9909a19",
-      "name": "per Item2"
+      "name": "Existing projects"
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\n\nconst existing = [];\nconst missing = [];\n\nitems.forEach((item, index) => {\n  const workflow = $('per Item2').itemMatching(index).json;\n\n  const status = item.json.statusCode ?? item.json.error?.status;\n\n  if (status === 200) {\n    existing.push(workflow);\n  } else if (status === 404 || item.json.error) {\n    missing.push(workflow);\n  }\n});\n\nreturn [{\n  json: {\n    allFilesExist: missing.length === 0,\n    existingCount: existing.length,\n    missingCount: missing.length,\n    existing,\n    missing\n  }\n}];"
+        "jsCode": "const items = $input.all();\n\nconst existing = [];\nconst missing = [];\n\nitems.forEach((item, index) => {\n  const workflow = $('Existing projects').itemMatching(index).json;\n\n  const status = item.json.statusCode ?? item.json.error?.status;\n\n  if (status === 200) {\n    existing.push(workflow);\n  } else if (status === 404 || item.json.error) {\n    missing.push(workflow);\n  }\n});\n\nreturn [{\n  json: {\n    allFilesExist: missing.length === 0,\n    existingCount: existing.length,\n    missingCount: missing.length,\n    existing,\n    missing\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -275,7 +275,7 @@
         6800
       ],
       "id": "358375f8-2127-4dad-9d78-ba5d7e409631",
-      "name": "Divide based on file exsistance1"
+      "name": "Split existing and missing files"
     },
     {
       "parameters": {
@@ -308,7 +308,7 @@
         6800
       ],
       "id": "be30b642-49cb-4fe7-804f-c43cf567c0a1",
-      "name": "If all of them have file1"
+      "name": "All files exist?"
     },
     {
       "parameters": {
@@ -322,7 +322,7 @@
         7280
       ],
       "id": "eb25f04d-038e-432c-b4d8-348ea8c31bb7",
-      "name": "Split Out4"
+      "name": "Split Out missing files"
     },
     {
       "parameters": {
@@ -363,7 +363,7 @@
         7280
       ],
       "id": "af183fe2-6bc5-44f8-b115-8e1248330c38",
-      "name": "HTTP Request1",
+      "name": "Create workflow file",
       "retryOnFail": true,
       "credentials": {
         "httpHeaderAuth": {
@@ -384,12 +384,12 @@
         7264
       ],
       "id": "59f33c2d-bdbf-4024-bc4a-495c33fe6023",
-      "name": "Wait3",
+      "name": "Wait for release branch",
       "webhookId": "2d370fe1-1705-40d2-988d-83708fe26618"
     },
     {
       "parameters": {
-        "jsCode": "const existing = $(\"If all of them have file1\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
+        "jsCode": "const existing = $(\"All files exist?\").first().json.existing || [];\n\nreturn existing.map(workflow => ({\n  json: workflow\n}));"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -398,7 +398,7 @@
         6560
       ],
       "id": "8f107252-f6c2-41e2-ab0f-4bcb71747a0e",
-      "name": "per Item3"
+      "name": "Existing files"
     },
     {
       "parameters": {
@@ -411,7 +411,7 @@
         6400
       ],
       "id": "b4f5400f-57b1-4805-9f46-b01bce8160f7",
-      "name": "Create arrays1"
+      "name": "Group changed and unchanged"
     },
     {
       "parameters": {
@@ -444,7 +444,7 @@
         6400
       ],
       "id": "24da89c0-9471-4829-93b8-f1c6231d1af2",
-      "name": "If no need to upload1"
+      "name": "No changes to upload?"
     },
     {
       "parameters": {
@@ -458,12 +458,12 @@
         6544
       ],
       "id": "fae64e98-89c0-45ea-b075-470f1b463378",
-      "name": "Split Out5"
+      "name": "Split Out changed workflows"
     },
     {
       "parameters": {
         "method": "DELETE",
-        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out4').item.json.projectId }}/protected_branches/dev",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out missing files').item.json.projectId }}/protected_branches/dev",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
@@ -493,7 +493,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out4').item.json.projectId }}/repository/branches?branch=release&ref=dev",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out missing files').item.json.projectId }}/repository/branches?branch=release&ref=dev",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
@@ -512,7 +512,7 @@
         7264
       ],
       "id": "19524e0c-28a4-428b-bd21-c0703e462fe4",
-      "name": "Create Release1",
+      "name": "Create release branch",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -522,7 +522,7 @@
     },
     {
       "parameters": {
-        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out5').item.json.projectId }}/repository/files/CHANGELOG.md/raw",
+        "url": "={{ $('Set GitLab Config').first().json.GITLAB_URL }}/api/v4/projects/{{ $('Split Out changed workflows').item.json.projectId }}/repository/files/CHANGELOG.md/raw",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendQuery": true,
@@ -555,7 +555,7 @@
         6752
       ],
       "id": "f850c24b-9743-4f31-a1a6-5d6f7215f3db",
-      "name": "Get existing changelog1",
+      "name": "Get existing changelog",
       "alwaysOutputData": true,
       "credentials": {
         "httpHeaderAuth": {
@@ -567,7 +567,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\n\nfunction bakuTimestamp() {\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'Asia/Baku',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));\n  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (Baku, GMT+4)`;\n}\n\nfunction findStructured(obj, depth) {\n  if (!obj || typeof obj !== 'object' || depth > 6) return null;\n  if (Array.isArray(obj.added) || Array.isArray(obj.changed) || Array.isArray(obj.removed) || typeof obj.summary === 'string') {\n    return {\n      summary: obj.summary || '',\n      added: Array.isArray(obj.added) ? obj.added : [],\n      changed: Array.isArray(obj.changed) ? obj.changed : [],\n      removed: Array.isArray(obj.removed) ? obj.removed : []\n    };\n  }\n  for (const key of Object.keys(obj)) {\n    const val = obj[key];\n    if (val && typeof val === 'object') {\n      const found = findStructured(val, depth + 1);\n      if (found) return found;\n    }\n  }\n  return null;\n}\n\nfunction renderStructured(result) {\n  const blocks = [];\n  if (result.summary) blocks.push(result.summary);\n  if (result.added.length) blocks.push('### Added\\n' + result.added.map(l => `- ${l}`).join('\\n'));\n  if (result.changed.length) blocks.push('### Changed\\n' + result.changed.map(l => `- ${l}`).join('\\n'));\n  if (result.removed.length) blocks.push('### Removed\\n' + result.removed.map(l => `- ${l}`).join('\\n'));\n  return blocks.join('\\n\\n');\n}\n\nreturn items.map((item, index) => {\n  const src = $('Split Out5').all()[index].json;\n  const resp = item.json;\n  const changelogExists = resp.statusCode === 200;\n  const existingContent = changelogExists && typeof resp.data === 'string' ? resp.data : '';\n  const timestamp = bakuTimestamp();\n\n  let aiResult = null;\n  try {\n    const aiItem = $('AI Agent').all()[index];\n    aiResult = aiItem && aiItem.json ? findStructured(aiItem.json, 0) : null;\n  } catch (e) {\n    aiResult = null;\n  }\n\n  let bodyText;\n  if (aiResult && (aiResult.summary || aiResult.added.length || aiResult.changed.length || aiResult.removed.length)) {\n    bodyText = renderStructured(aiResult);\n  } else {\n    bodyText = (src.changeSummaryText && src.changeSummaryText.length) ? src.changeSummaryText : '- Workflow updated.';\n  }\n\n  const entry = `## ${timestamp} \\u2014 ${src.workflowName}\\n\\n${bodyText}\\n\\n`;\n\n  return {\n    json: {\n      ...src,\n      changelogExists,\n      changelogContent: entry + existingContent\n    }\n  };\n});"
+        "jsCode": "const items = $input.all();\n\nfunction bakuTimestamp() {\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'Asia/Baku',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));\n  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (Baku, GMT+4)`;\n}\n\nfunction findStructured(obj, depth) {\n  if (!obj || typeof obj !== 'object' || depth > 6) return null;\n  if (Array.isArray(obj.added) || Array.isArray(obj.changed) || Array.isArray(obj.removed) || typeof obj.summary === 'string') {\n    return {\n      summary: obj.summary || '',\n      added: Array.isArray(obj.added) ? obj.added : [],\n      changed: Array.isArray(obj.changed) ? obj.changed : [],\n      removed: Array.isArray(obj.removed) ? obj.removed : []\n    };\n  }\n  for (const key of Object.keys(obj)) {\n    const val = obj[key];\n    if (val && typeof val === 'object') {\n      const found = findStructured(val, depth + 1);\n      if (found) return found;\n    }\n  }\n  return null;\n}\n\nfunction renderStructured(result) {\n  const blocks = [];\n  if (result.summary) blocks.push(result.summary);\n  if (result.added.length) blocks.push('### Added\\n' + result.added.map(l => `- ${l}`).join('\\n'));\n  if (result.changed.length) blocks.push('### Changed\\n' + result.changed.map(l => `- ${l}`).join('\\n'));\n  if (result.removed.length) blocks.push('### Removed\\n' + result.removed.map(l => `- ${l}`).join('\\n'));\n  return blocks.join('\\n\\n');\n}\n\nreturn items.map((item, index) => {\n  const src = $('Split Out changed workflows').all()[index].json;\n  const resp = item.json;\n  const changelogExists = resp.statusCode === 200;\n  const existingContent = changelogExists && typeof resp.data === 'string' ? resp.data : '';\n  const timestamp = bakuTimestamp();\n\n  let aiResult = null;\n  try {\n    const aiItem = $('AI Agent').all()[index];\n    aiResult = aiItem && aiItem.json ? findStructured(aiItem.json, 0) : null;\n  } catch (e) {\n    aiResult = null;\n  }\n\n  let bodyText;\n  if (aiResult && (aiResult.summary || aiResult.added.length || aiResult.changed.length || aiResult.removed.length)) {\n    bodyText = renderStructured(aiResult);\n  } else {\n    bodyText = (src.changeSummaryText && src.changeSummaryText.length) ? src.changeSummaryText : '- Workflow updated.';\n  }\n\n  const entry = `## ${timestamp} \\u2014 ${src.workflowName}\\n\\n${bodyText}\\n\\n`;\n\n  return {\n    json: {\n      ...src,\n      changelogExists,\n      changelogContent: entry + existingContent\n    }\n  };\n});"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -576,7 +576,7 @@
         6752
       ],
       "id": "5eaa9415-0aa1-421c-bec8-3d6404069e86",
-      "name": "Build changelog entry1"
+      "name": "Build changelog entry"
     },
     {
       "parameters": {
@@ -609,7 +609,7 @@
         6752
       ],
       "id": "2298824b-9df5-46bb-bed8-ef194965a70b",
-      "name": "Changelog exists?1"
+      "name": "Changelog exists?"
     },
     {
       "parameters": {
@@ -637,7 +637,7 @@
         6640
       ],
       "id": "78645821-8e01-4296-aa93-be8fcf7f1f70",
-      "name": "Update CHANGELOG.md1",
+      "name": "Update CHANGELOG.md",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -672,7 +672,7 @@
         6864
       ],
       "id": "e9b080e8-6bbf-473e-a0c3-5376dc76bda5",
-      "name": "Create CHANGELOG.md1",
+      "name": "Create CHANGELOG.md",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -724,7 +724,7 @@
         "text": "=Generate the changelog entry now based on the detected changes described above.",
         "hasOutputParser": true,
         "options": {
-          "systemMessage": "=You are a deterministic diff-to-changelog transformer for an internal DevSecOps automation system. You do not analyze, infer, or add anything — you only reformat the exact diff below into three categorized lists.\n\nWorkflow name:\n{{ $('Split Out5').all()[$itemIndex].json.workflowName }}\n\nDetected changes (a complete, machine-generated diff — nothing happened beyond what is listed here):\n{{ $('Split Out5').all()[$itemIndex].json.changeSummaryText }}\n\nHOW TO READ THE DIFF — every line follows one of these exact patterns. Map each one using this table, with no exceptions:\n\n- \"Added nodes: X (type), Y (type)\" → one \"added\" bullet per node: Added node \"X\" (type).\n- \"Removed nodes: X (type)\" → one \"removed\" bullet per node: Removed node \"X\" (type).\n- \"Modified node \"X\" (type):\" followed by indented \"  - ...\" lines → one \"changed\" bullet per indented line, in the form Node \"X\": <that line's content>. Use this sub-mapping for the indented line's own content:\n  - \"Node deactivated (disabled in n8n).\" → Node \"X\" was deactivated (disabled).\n  - \"Node re-activated (enabled in n8n).\" → Node \"X\" was re-activated (enabled).\n  - \"<param>: added text: \"...\"\" → Node \"X\" — <param> had text added: \"...\".\n  - \"<param>: removed text: \"...\"\" → Node \"X\" — <param> had text removed: \"...\".\n  - \"<param>: replaced \"...\" with \"...\"\" → Node \"X\" — <param> changed from \"...\" to \"...\".\n  - \"<param>: A → B\" (non-text value) → Node \"X\" — <param> changed from A to B.\n  - \"credentials assignment changed.\" → Node \"X\" credentials assignment changed.\n  - \"notes: ...\" → Node \"X\" notes updated.\n- \"Added connections: \"A\" → \"B\", ...\" → one \"added\" bullet per pair: Connection added from \"A\" to \"B\".\n- \"Removed connections: \"A\" → \"B\", ...\" → one \"removed\" bullet per pair: Connection removed from \"A\" to \"B\".\n- \"Field \"X\" changed.\" (not under a node) → one \"changed\" bullet: Workflow-level field \"X\" changed.\n- \"New workflow file (no previous version found in GitLab).\" → summary: \"New workflow file added to GitLab.\"; leave added/changed/removed empty unless Added nodes/connections lines are also present.\n- \"Workflow content changed (no structural diff detected — likely formatting/metadata only).\" → summary: \"Workflow updated (formatting/metadata only).\"; leave all three arrays empty.\n\nSTRICT RULES:\n1. Every bullet must correspond 1:1 to a line literally present above. Never invent a node name, parameter, value, count, ordering, or reason not literally in that text.\n2. Never merge unrelated lines into one narrative. Only describe a node as both \"re-enabled\" and \"reconnected\" if BOTH a disabled-line AND a connections-line are separately present for it — do not combine them from imagination.\n3. Do not add commentary about why a change was made, its impact, or your interpretation of intent. State only what changed.\n4. If Detected changes is empty, blank, or only the \"no structural diff\" fallback line, return added: [], changed: [], removed: [], summary: \"Workflow updated.\"\n5. \"summary\" must be built only from bullets you already generated in added/changed/removed — never introduce a new fact in the summary.\n6. No Markdown headings, no timestamps, no text outside the structured fields.\n\nTransform the Detected changes above into the three categorized arrays plus the one-sentence summary now."
+          "systemMessage": "=You are a deterministic diff-to-changelog transformer for an internal DevSecOps automation system. You do not analyze, infer, or add anything — you only reformat the exact diff below into three categorized lists.\n\nWorkflow name:\n{{ $('Split Out changed workflows').all()[$itemIndex].json.workflowName }}\n\nDetected changes (a complete, machine-generated diff — nothing happened beyond what is listed here):\n{{ $('Split Out changed workflows').all()[$itemIndex].json.changeSummaryText }}\n\nHOW TO READ THE DIFF — every line follows one of these exact patterns. Map each one using this table, with no exceptions:\n\n- \"Added nodes: X (type), Y (type)\" → one \"added\" bullet per node: Added node \"X\" (type).\n- \"Removed nodes: X (type)\" → one \"removed\" bullet per node: Removed node \"X\" (type).\n- \"Modified node \"X\" (type):\" followed by indented \"  - ...\" lines → one \"changed\" bullet per indented line, in the form Node \"X\": <that line's content>. Use this sub-mapping for the indented line's own content:\n  - \"Node deactivated (disabled in n8n).\" → Node \"X\" was deactivated (disabled).\n  - \"Node re-activated (enabled in n8n).\" → Node \"X\" was re-activated (enabled).\n  - \"<param>: added text: \"...\"\" → Node \"X\" — <param> had text added: \"...\".\n  - \"<param>: removed text: \"...\"\" → Node \"X\" — <param> had text removed: \"...\".\n  - \"<param>: replaced \"...\" with \"...\"\" → Node \"X\" — <param> changed from \"...\" to \"...\".\n  - \"<param>: A → B\" (non-text value) → Node \"X\" — <param> changed from A to B.\n  - \"credentials assignment changed.\" → Node \"X\" credentials assignment changed.\n  - \"notes: ...\" → Node \"X\" notes updated.\n- \"Added connections: \"A\" → \"B\", ...\" → one \"added\" bullet per pair: Connection added from \"A\" to \"B\".\n- \"Removed connections: \"A\" → \"B\", ...\" → one \"removed\" bullet per pair: Connection removed from \"A\" to \"B\".\n- \"Field \"X\" changed.\" (not under a node) → one \"changed\" bullet: Workflow-level field \"X\" changed.\n- \"New workflow file (no previous version found in GitLab).\" → summary: \"New workflow file added to GitLab.\"; leave added/changed/removed empty unless Added nodes/connections lines are also present.\n- \"Workflow content changed (no structural diff detected — likely formatting/metadata only).\" → summary: \"Workflow updated (formatting/metadata only).\"; leave all three arrays empty.\n\nSTRICT RULES:\n1. Every bullet must correspond 1:1 to a line literally present above. Never invent a node name, parameter, value, count, ordering, or reason not literally in that text.\n2. Never merge unrelated lines into one narrative. Only describe a node as both \"re-enabled\" and \"reconnected\" if BOTH a disabled-line AND a connections-line are separately present for it — do not combine them from imagination.\n3. Do not add commentary about why a change was made, its impact, or your interpretation of intent. State only what changed.\n4. If Detected changes is empty, blank, or only the \"no structural diff\" fallback line, return added: [], changed: [], removed: [], summary: \"Workflow updated.\"\n5. \"summary\" must be built only from bullets you already generated in added/changed/removed — never introduce a new fact in the summary.\n6. No Markdown headings, no timestamps, no text outside the structured fields.\n\nTransform the Detected changes above into the three categorized arrays plus the one-sentence summary now."
         }
       },
       "type": "@n8n/n8n-nodes-langchain.agent",
@@ -789,7 +789,7 @@
         6672
       ],
       "id": "b1d3ed0b-d9ff-44a6-855e-8b132d451f40",
-      "name": "OpenRouter Chat Model1",
+      "name": "OpenRouter Chat Model (output parser)",
       "credentials": {
         "openRouterApi": {
           "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
@@ -959,7 +959,7 @@
   ],
   "pinData": {},
   "connections": {
-    "n8n_backup.sh": {
+    "Read folder tree from Postgres": {
       "main": [
         [
           {
@@ -970,29 +970,29 @@
         ]
       ]
     },
-    "fetch matching file from GitLab1": {
+    "Fetch current file from GitLab": {
       "main": [
         [
           {
-            "node": "Diff workflow JSON1",
+            "node": "Diff workflow JSON",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Diff workflow JSON1": {
+    "Diff workflow JSON": {
       "main": [
         [
           {
-            "node": "Create arrays1",
+            "node": "Group changed and unchanged",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Update JSON1": {
+    "Update workflow file": {
       "main": [
         [
           {
@@ -1003,58 +1003,58 @@
         ]
       ]
     },
-    "if all of them have repo1": {
+    "All projects exist?": {
       "main": [
         [
           {
-            "node": "per Item2",
+            "node": "Existing projects",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Split Out",
+            "node": "Split Out missing projects",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "division1": {
+    "Split existing and missing projects": {
       "main": [
         [
           {
-            "node": "if all of them have repo1",
+            "node": "All projects exist?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split Out": {
+    "Split Out missing projects": {
       "main": [
         [
           {
-            "node": "Create repo1",
+            "node": "Create GitLab project",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Create repo1": {
+    "Create GitLab project": {
       "main": [
         [
           {
-            "node": "Wait2",
+            "node": "Wait for new projects",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Wait2": {
+    "Wait for new projects": {
       "main": [
         [
           {
@@ -1065,80 +1065,80 @@
         ]
       ]
     },
-    "Check if file exists1": {
+    "Check if file exists": {
       "main": [
         [
           {
-            "node": "Divide based on file exsistance1",
+            "node": "Split existing and missing files",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "per Item2": {
+    "Existing projects": {
       "main": [
         [
           {
-            "node": "Check if file exists1",
+            "node": "Check if file exists",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Divide based on file exsistance1": {
+    "Split existing and missing files": {
       "main": [
         [
           {
-            "node": "If all of them have file1",
+            "node": "All files exist?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "If all of them have file1": {
+    "All files exist?": {
       "main": [
         [
           {
-            "node": "per Item3",
+            "node": "Existing files",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Split Out4",
+            "node": "Split Out missing files",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split Out4": {
+    "Split Out missing files": {
       "main": [
         [
           {
-            "node": "HTTP Request1",
+            "node": "Create workflow file",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "HTTP Request1": {
+    "Create workflow file": {
       "main": [
         [
           {
-            "node": "Create Release1",
+            "node": "Create release branch",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Wait3": {
+    "Wait for release branch": {
       "main": [
         [
           {
@@ -1149,45 +1149,45 @@
         ]
       ]
     },
-    "per Item3": {
+    "Existing files": {
       "main": [
         [
           {
-            "node": "fetch matching file from GitLab1",
+            "node": "Fetch current file from GitLab",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Create arrays1": {
+    "Group changed and unchanged": {
       "main": [
         [
           {
-            "node": "If no need to upload1",
+            "node": "No changes to upload?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "If no need to upload1": {
+    "No changes to upload?": {
       "main": [
         [],
         [
           {
-            "node": "Split Out5",
+            "node": "Split Out changed workflows",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split Out5": {
+    "Split Out changed workflows": {
       "main": [
         [
           {
-            "node": "Update JSON1",
+            "node": "Update workflow file",
             "type": "main",
             "index": 0
           }
@@ -1198,65 +1198,65 @@
       "main": [
         [
           {
-            "node": "per Item2",
+            "node": "Existing projects",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Create Release1": {
+    "Create release branch": {
       "main": [
         [
           {
-            "node": "Wait3",
+            "node": "Wait for release branch",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Get existing changelog1": {
+    "Get existing changelog": {
       "main": [
         [
           {
-            "node": "Build changelog entry1",
+            "node": "Build changelog entry",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Build changelog entry1": {
+    "Build changelog entry": {
       "main": [
         [
           {
-            "node": "Changelog exists?1",
+            "node": "Changelog exists?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Changelog exists?1": {
+    "Changelog exists?": {
       "main": [
         [
           {
-            "node": "Update CHANGELOG.md1",
+            "node": "Update CHANGELOG.md",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Create CHANGELOG.md1",
+            "node": "Create CHANGELOG.md",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Update CHANGELOG.md1": {
+    "Update CHANGELOG.md": {
       "main": [
         [
           {
@@ -1267,7 +1267,7 @@
         ]
       ]
     },
-    "Create CHANGELOG.md1": {
+    "Create CHANGELOG.md": {
       "main": [
         [
           {
@@ -1304,7 +1304,7 @@
       "main": [
         [
           {
-            "node": "Get existing changelog1",
+            "node": "Get existing changelog",
             "type": "main",
             "index": 0
           }
@@ -1333,7 +1333,7 @@
         ]
       ]
     },
-    "OpenRouter Chat Model1": {
+    "OpenRouter Chat Model (output parser)": {
       "ai_languageModel": [
         [
           {
@@ -1370,7 +1370,7 @@
       "main": [
         [
           {
-            "node": "division1",
+            "node": "Split existing and missing projects",
             "type": "main",
             "index": 0
           }
@@ -1381,7 +1381,7 @@
       "main": [
         [
           {
-            "node": "per Item3",
+            "node": "Existing files",
             "type": "main",
             "index": 0
           }
@@ -1403,7 +1403,7 @@
       "main": [
         [
           {
-            "node": "n8n_backup.sh",
+            "node": "Read folder tree from Postgres",
             "type": "main",
             "index": 0
           }
