@@ -51,12 +51,6 @@ For each workflow:
         └─ Send diff to AI Agent → append entry to CHANGELOG.md
 ```
 
-### Branches and branch protection
-
-New projects use `dev` as their default branch, and every sync commits to `dev`. When a workflow file is created for the first time, the workflow also creates a `release` branch from `dev` and then removes GitLab's automatic protection from `dev` (`DELETE /projects/:id/protected_branches/dev`), so the sync token can keep committing to it.
-
-This means anyone with Developer access to these projects can push to `dev` directly. Treat `release` as the reviewed branch: protect it, and promote changes from `dev` to `release` through merge requests. If your GitLab policy does not allow unprotected default branches, remove the `Unprotect dev` node and give the sync token a role that is allowed to push to protected branches instead.
-
 ### Why SSH instead of the REST API
 
 n8n's REST API doesn't expose folder structure on the free tier — there's no endpoint that tells you which folder a given workflow lives in. Folders are stored in n8n's Postgres database as a self-referencing table (each folder row points to its parent), so this workflow connects over SSH and runs a recursive query to reconstruct the full path for every workflow:
@@ -90,12 +84,6 @@ JOIN folder_tree ft ON w."parentFolderId" = ft.id
 
 That `folder_path` (e.g. `prod/Marketing/Email-Sync`) is what the workflow later uses to build the matching group/subgroup path in GitLab.
 
-### Why diffing needs to filter noise
-
-n8n rewrites fields like node `position`, internal `versionCounter`, and credential IDs on almost every save — even when nothing meaningful actually changed. A naive JSON diff would treat every autosave as a "change" and flood GitLab with empty commits. The diff step strips these fields out first and only flags:
-- Nodes added or removed
-- Parameters changed
-- Connections added or removed
 
 ## Prerequisites
 
