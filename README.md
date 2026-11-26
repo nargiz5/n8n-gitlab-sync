@@ -23,6 +23,8 @@ In our setup, the sync runs on two triggers:
 
 Production workflows change when a finished version is deployed, not while someone is still editing, so each on-change sync records a complete change.
 
+The [write-up](https://medium.com/@nargiz.bakhshaliyeva.05/git-based-version-control-to-n8n-workflows-with-gitlab-29cdebad5825) describes the first version, in which the webhook was called by hand or from a deployment; the database trigger was added later.
+
 ## How It Works
 
 ```
