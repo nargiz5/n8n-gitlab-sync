@@ -12,7 +12,16 @@ n8n has built-in workflow history and version restore, but full Git-based versio
 - Ignores noise (node positions, internal version counters) and only commits real structural changes
 - Auto-creates GitLab projects for new workflows
 - Writes an AI-generated `CHANGELOG.md` entry for every real change
-- Runs on a schedule (default: daily), and can be started right after a change through an authenticated webhook or manually
+- Runs every morning at 7:00, and can be started right after a change through an authenticated webhook or manually
+
+## How It Runs in Production
+
+In our setup, the sync runs on two triggers:
+
+- **Schedule:** every morning at 7:00, as a safety net.
+- **On change:** a PostgreSQL trigger on n8n's own database watches the workflows' `updatedAt` column. When a production workflow is updated, it calls the authenticated webhook, so the change reaches GitLab within moments instead of the next morning.
+
+Production workflows change when a finished version is deployed, not while someone is still editing, so each on-change sync records a complete change.
 
 ## How It Works
 
@@ -121,7 +130,7 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
 
 
 
-4. **Adjust the schedule.** The `Schedule Trigger` node defaults to once daily; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
+4. **Adjust the schedule.** The `Schedule Trigger` node runs once a day at 7:00; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
 
 5. **Optional: trigger on change.** Instead of waiting for the schedule, call the `Webhook Trigger` right after workflows change, for example as the last step of a deploy to production or from a GitLab webhook:
 
