@@ -119,9 +119,7 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
    | `N8N_ROOT_FOLDER_ID` | `abc123XYZ` | The n8n folder ID to track — find it in n8n's UI URL when viewing the folder, or by querying the `folder` table directly |
    | `GITLAB_PRIVATE_TOKEN` | `glpat-xxxxxxxx` | A GitLab access token with API + write_repository scope, used by the `Resolve GitLab subgroup path` code node |
 
-   > ⚠️ These values are stored as plain text inside the node, which means they end up in the exported JSON — unlike the credentials above, which n8n encrypts and keeps out of exports. Fill this node in on your own instance, but **never export/commit/share this workflow with real values still in it.** If you plan to keep a copy of this workflow in a public repo, keep it with placeholder values and fill in the real ones only after importing.
 
-   > 🔒 Because this workflow commits n8n workflows to GitLab, it would also commit any secret typed directly into a node, including the token in this node if the sync workflow sits in the synced folder. Before diffing and committing, **Prepare workflow** masks such values as `***REDACTED***`: values of parameters named like a password, secret, token, API key or authorization header, and strings that look like GitLab, GitHub, OpenAI/OpenRouter, Slack, Telegram or AWS keys and private keys. Saved test data (`pinData`) is dropped. The masked form is also what the changelog model sees. Masking is a safety net, not a substitute for n8n credentials: if a real secret was committed before this step existed, rotate it, because it remains in the project's Git history.
 
 4. **Adjust the schedule.** The `Schedule Trigger` node defaults to once daily; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
 
