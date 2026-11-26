@@ -132,15 +132,8 @@ n8n rewrites fields like node `position`, internal `versionCounter`, and credent
 
 4. **Adjust the schedule.** The `Schedule Trigger` node runs once a day at 7:00; change the interval to whatever cadence fits your workflow volume. Very frequent runs (e.g. every few minutes) tend to catch workflows mid-edit and produce noisier history — daily or hourly is usually a better fit than real-time.
 
-5. **Optional: trigger on change.** Instead of waiting for the schedule, call the `Webhook Trigger` right after workflows change, for example as the last step of a deploy to production or from a GitLab webhook:
 
-   ```bash
-   curl -X POST https://<your-n8n>/webhook/n8n-gitlab-sync -H "<header-name>: <header-value>"
-   ```
-
-   Call it once the change is finished rather than on every save, for the same reason as above.
-
-6. **Activate the workflow.** The exported workflow is inactive. Once activated, it runs on schedule, whenever the webhook is called, and manually from the n8n canvas.
+5. **Activate the workflow.** The exported workflow is inactive. Once activated, it runs on schedule, whenever the webhook is called, and manually from the n8n canvas.
 
 ## Example Output
 
